@@ -1,0 +1,38 @@
+{
+  "material_spaces": {
+    "jelly": {
+      "E": { "type": "log_uniform", "min": 1000.0, "max": 100000.0 },
+      "nu": { "type": "uniform", "min": 0.1, "max": 0.46 },
+      "density": { "type": "uniform", "min": 100.0, "max": 10000.0 },
+      "grid_lim": 2.0,
+      "n_grid": 150,
+      "rpic_damping": 0.35,
+      "grid_v_damping_scale": 0.9990
+    },
+
+    "plasticine": {
+      "E": { "type": "log_uniform", "min": 1000.0, "max": 100000.0 },
+      "nu": { "type": "uniform", "min": 0.1, "max": 0.46 },
+      "density": { "type": "uniform", "min": 100.0, "max": 10000.0 },
+      "yield_stress": { "type": "log_uniform", "min": 100.0, "max": 100000.0 },
+      "hardening": { "type": "uniform", "min": 0.05, "max": 0.45 },
+      "softening": { "type": "uniform", "min": 0.05, "max": 0.45 },
+      "grid_lim": 2.0,
+      "n_grid": 150,
+      "rpic_damping": 0.45,
+      "grid_v_damping_scale": 0.9992
+    },
+
+    "metal": {
+      "E": { "type": "log_uniform", "min": 250000.0, "max": 12000000.0 },
+      "nu": { "type": "uniform", "min": 0.1, "max": 0.46 },
+      "density": { "type": "uniform", "min": 1000.0, "max": 100000.0 },
+      "yield_stress": { "type": "log_uniform", "min": 100.0, "max": 100000.0 },
+      "hardening": { "type": "uniform", "min": 0.05, "max": 0.70 },
+      "grid_lim": 2.0,
+      "n_grid": 150,
+      "rpic_damping": 0.25,
+      "grid_v_damping_scale": 0.9995
+    }
+  }
+}

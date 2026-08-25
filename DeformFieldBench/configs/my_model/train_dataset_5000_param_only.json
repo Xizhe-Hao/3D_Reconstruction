@@ -1,0 +1,69 @@
+{
+  "data": {
+    "split_root": "auto_output/dataset_5000/train",
+    "auto_output": "auto_output"
+  },
+  "model": {
+    "num_views": 3,
+    "num_frames": 64,
+    "img_size": 224,
+    "in_channels": 1,
+    "input_mode": "images",
+    "dec_h": 112,
+    "dec_w": 112,
+    "use_aux_field_heads": true,
+    "use_attention_pool": true,
+    "use_uncertainty": false,
+    "encoder_dropout": 0.05,
+    "head_dropout": 0.1,
+    "encoder_embed_dim": 384,
+    "encoder_depth": 12,
+    "encoder_num_heads": 6,
+    "tubelet_size": 1,
+    "patch_size": 32,
+    "fusion_dim": 512,
+    "fusion_heads": 8
+  },
+  "train": {
+    "epochs": 400,
+    "preflight": false,
+    "batch_size": 1,
+    "lr": 0.0003,
+    "num_workers": 0,
+    "overfit_num_samples": 0,
+    "disable_aux_losses": true,
+    "lambda_stress": 0,
+    "lambda_flow": 0,
+    "lambda_force": 0,
+    "no_log_scale": false,
+    "train_ids_json": "auto_output/dataset_5000/train_test_split.cleaned.json",
+    "debug_regression_print": {
+      "enabled": false,
+      "every_steps": 10,
+      "max_prints": 1000,
+      "sample_index_in_batch": 0
+    },
+    "quick_eval": {
+      "enabled": false,
+      "every_epochs": 50,
+      "weights": "last",
+      "batch_size": 1,
+      "num_workers": 0,
+      "num_vis": 2,
+      "vis_view": 0,
+      "sample_limit": 4,
+      "split_root": null,
+      "train_ids_json": "train_test_split.json",
+      "test_ids_json": "train_test_split.json"
+    },
+    "device": "cuda",
+    "checkpoint": {
+      "save_dir": "output_checkpoints/my_model_dataset_5000_param_only",
+      "resume_from": null,
+      "save_every_epochs": 200,
+      "save_last": true,
+      "save_best": false
+    }
+  },
+  "_description": "dataset_5000 参数回归：disable_aux_losses 关闭 stress/flow/force 场监督"
+}

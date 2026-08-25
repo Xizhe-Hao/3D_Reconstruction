@@ -1,0 +1,20 @@
+Sample id: {sample_id}
+View name: {view_name}
+
+Generate exactly one PNG image: a 4-panel horizontal contact sheet of stress heatmaps for the object in the input video frames.
+
+Panel layout:
+- Number of panels: {num_frames}
+- Order from left to right: early, early-middle, late-middle, late
+- The API may require a square canvas. Fill the whole canvas with 4 equal-width vertical panels from left to right.
+- Do not leave empty margins. The evaluator will crop/slice the result into {num_frames} panels and resize each panel to {frame_w} x {frame_h}.
+
+Physics guidance:
+- Put high stress near the main contact / loaded / compressed / stretched / bent / sheared regions.
+- Preserve the object's visible shape and camera view from the input frames.
+- Keep stable, undeformed, and background regions low stress.
+- Use smooth spatial fields with physically plausible hotspots; avoid noisy speckles.
+
+Hard constraints:
+- Output only the heatmap image.
+- No text, no labels, no axes, no grid lines, no colorbar, no borders, no arrows, no watermark, no caption, no extra objects.

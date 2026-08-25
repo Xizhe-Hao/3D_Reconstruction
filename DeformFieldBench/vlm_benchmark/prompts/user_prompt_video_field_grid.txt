@@ -1,0 +1,38 @@
+下面是一段同一物体在受力作用下的 RGB 视频。请根据整段视频的时序形变和运动变化，输出三个低分辨率时空场：
+
+1. `force_mask`：主要受力 / 接触区域的软 mask；
+2. `flow`：物体显著变化强度图，强调主要变化区域；
+3. `stress`：热力图式应力强度，强调高应力热点。
+
+请按以下规则输出：
+- `sample_id` 必须输出为 "{sample_id}"；
+- `view_name` 必须输出为 "{view_name}"；
+- 每个场都输出成 `grid_size={grid_size}`、`num_frames={num_frames}` 的整数网格；
+- 每个格点都必须是 0 到 9 的整数；
+- 4 个时间帧请覆盖视频的早期、偏早中期、偏晚中期、晚期；
+- 只输出主导区域和主导趋势，忽略噪声小块；
+- 输出必须是单个 JSON 对象，且字段名必须完全一致。
+
+JSON 模板如下，请严格遵守：
+{{
+  "sample_id": "{sample_id}",
+  "view_name": "{view_name}",
+  "force_mask": {{
+    "format": "soft_mask_grid_v1",
+    "grid_size": {grid_size},
+    "num_frames": {num_frames},
+    "frames": [[[0]]]
+  }},
+  "flow": {{
+    "format": "change_grid_v1",
+    "grid_size": {grid_size},
+    "num_frames": {num_frames},
+    "frames": [[[0]]]
+  }},
+  "stress": {{
+    "format": "heat_grid_v1",
+    "grid_size": {grid_size},
+    "num_frames": {num_frames},
+    "frames": [[[0]]]
+  }}
+}}

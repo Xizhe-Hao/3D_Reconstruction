@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Data & captures (never commit large data)
+captures/
+auto_output/
+outputs/
+output_checkpoints/
+*.npz
+*.h5
+!DeformFieldBench/simulation/mpm_solver_warp/sand_column.h5
+*.pt
+*.pth
+*.ckpt
+*.mp4
+*.bmp
+*.avi
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs
+*.log
+wandb/

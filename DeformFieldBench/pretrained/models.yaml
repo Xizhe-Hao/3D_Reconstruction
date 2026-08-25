@@ -1,0 +1,25 @@
+models:
+  logic_baseline:
+    file: pretrained/logic_baseline_epoch_0320.pt
+    url: https://huggingface.co/HandsomeHusky/DeformFieldBench/resolve/main/pretrained/logic_baseline_epoch_0320.pt
+    size_bytes: 5398088929
+  supervised_baseline:
+    file: pretrained/supervised_baseline_last.pt
+    url: https://huggingface.co/HandsomeHusky/DeformFieldBench/resolve/main/pretrained/supervised_baseline_last.pt
+    size_bytes: 15207016873
+  logic_abl_no_boundary:
+    file: pretrained/logic_abl_no_boundary.pt
+    url: https://huggingface.co/HandsomeHusky/DeformFieldBench/resolve/main/pretrained/logic_abl_no_boundary.pt
+    size_bytes: 5398088993
+  logic_abl_no_field_aux:
+    file: pretrained/logic_abl_no_field_aux.pt
+    url: https://huggingface.co/HandsomeHusky/DeformFieldBench/resolve/main/pretrained/logic_abl_no_field_aux.pt
+    size_bytes: 5398088929
+  logic_abl_no_multistage:
+    file: pretrained/logic_abl_no_multistage.pt
+    url: https://huggingface.co/HandsomeHusky/DeformFieldBench/resolve/main/pretrained/logic_abl_no_multistage.pt
+    size_bytes: 5398088929
+  logic_plus_phys_01:
+    file: pretrained/logic_plus_phys_01.pt
+    url: https://huggingface.co/HandsomeHusky/DeformFieldBench/resolve/main/pretrained/logic_plus_phys_01.pt
+    size_bytes: 5398088929

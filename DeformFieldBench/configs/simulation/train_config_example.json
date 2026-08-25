@@ -1,0 +1,40 @@
+{
+  "seed": 0,
+  "num_simulations": 10,
+  "sim_types": ["bend", "drop", "press", "shear", "stretch"],
+
+  "output_root": "auto_output",
+  "_comment_output": "by_model: auto_output/<ply名>/0000/；by_action: auto_output/<动作>/<ply名>/0000/；参数见各目录 gt_parameters.json",
+  "output_layout": "by_model",
+
+  "render_img": true,
+  "compile_multiview_videos": false,
+  "_compile_fallback": "若省略 compile_multiview_videos，则用 compile_video（默认 true）",
+  "num_views": 4,
+  "num_render_views": -1,
+  "_comment_render_N": "若设 render_outputs_per_sim_second>0（如 30），则 K≈仿真总秒数×30，视频 30fps，时长≈仿真时长；并忽略下方 num_render_timesteps 的 K 语义。",
+  "render_outputs_per_sim_second": 0,
+  "num_render_timesteps": 40,
+  "white_bg": false,
+  "debug": false,
+
+  "_comment_stress": "热力图：output_view_stress_heatmap；3DGS 应力：output_view_stress_gaussian（与 render_img 同相机，写 stress_gaussian/）；体积场：output_stress 等；transform_dataset 用 --copy_volumetric_fields 打入数据集",
+  "output_deformation": false,
+  "output_stress": false,
+  "field_output_interval": 1,
+  "output_view_stress_heatmap": false,
+  "output_view_stress_gaussian": true,
+  "output_view_flow_gaussian": true,
+  "no_volumetric_stress_deformation": false,
+
+  "output_bc_info": true,
+  "output_force_info": true,
+
+  "base_config_by_sim_type": {
+    "press": "config/press_cube_jelly.json",
+    "drop": "config/drop_cube_jelly.json",
+    "shear": "config/shear_cube_jelly.json",
+    "stretch": "config/stretch_cube_jelly.json",
+    "bend": "config/bend_cube_jelly.json"
+  }
+}

@@ -1,0 +1,11 @@
+# Tested with 64-bit CPython 3.10.11 on Windows.
+#
+# PySpin is intentionally not listed here. Install the official Teledyne
+# spinnaker_python wheel whose SDK version, Python tag (cp310), operating
+# system, and architecture match the installed Spinnaker SDK.
+
+numpy==1.26.4
+pyserial==3.5
+Pillow==12.3.0
+matplotlib==3.10.9
+imageio-ffmpeg==0.6.0
