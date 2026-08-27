@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Export three camera videos and a camera/sensor/force alignment table."""
+"""Export one video per camera and a camera/sensor/force alignment table.
+
+The number of cameras is read from the capture session (session.json, or the
+camera_* directories) so that adding or removing a camera needs no code change.
+"""
 
 from __future__ import annotations
 
@@ -16,7 +20,6 @@ import numpy as np
 from PIL import Image
 
 
-CAMERA_COUNT = 3
 BAYER_FFMPEG_FORMATS = {
     "BayerRG8": "bayer_rggb8",
     "BayerBG8": "bayer_bggr8",
@@ -53,16 +56,27 @@ def parse_args():
         help="Encode only the first N common frames; 0 encodes all frames.",
     )
     parser.add_argument(
+        "--cameras",
+        type=int,
+        default=0,
+        help=(
+            "Expected camera count. 0 takes it from session.json, falling "
+            "back to the number of camera_* directories."
+        ),
+    )
+    parser.add_argument(
         "--delete-images",
         action="store_true",
         help=(
-            "Delete source images only after all three MP4 files decode to "
-            "the expected frame count and alignment files are written."
+            "Delete source images only after every MP4 file decodes to the "
+            "expected frame count and alignment files are written."
         ),
     )
     args = parser.parse_args()
     if args.fps <= 0:
         parser.error("--fps must be positive")
+    if args.cameras < 0:
+        parser.error("--cameras must be non-negative")
     if not 0 <= args.crf <= 51:
         parser.error("--crf must be between 0 and 51")
     if args.max_frames < 0:
@@ -92,13 +106,44 @@ def find_ffmpeg():
     return imageio_ffmpeg.get_ffmpeg_exe()
 
 
-def load_cameras(session):
-    camera_dirs = sorted(
-        path for path in session.glob("camera_*") if path.is_dir()
+def camera_index_sort_key(path):
+    """Order camera_<index>_<serial> paths numerically, not alphabetically."""
+    parts = path.name.split("_")
+    try:
+        return (0, int(parts[1]), path.name)
+    except (IndexError, ValueError):
+        return (1, 0, path.name)
+
+
+def camera_directories(session):
+    """Return camera_* directories ordered by their capture index."""
+    return sorted(
+        (path for path in session.glob("camera_*") if path.is_dir()),
+        key=camera_index_sort_key,
     )
-    if len(camera_dirs) != CAMERA_COUNT:
+
+
+def expected_camera_count(session, session_metadata, requested):
+    """Resolve how many cameras this session is supposed to contain."""
+    if requested:
+        return requested
+    recorded = session_metadata.get("camera_count")
+    if recorded:
+        return int(recorded)
+    serials = session_metadata.get("camera_serials")
+    if serials:
+        return len(serials)
+    found = len(camera_directories(session))
+    if found < 1:
+        raise RuntimeError(f"No camera_* directories in {session}")
+    return found
+
+
+def load_cameras(session, camera_count):
+    camera_dirs = camera_directories(session)
+    if len(camera_dirs) != camera_count:
         raise RuntimeError(
-            f"Expected {CAMERA_COUNT} camera directories, "
+            f"Expected {camera_count} camera directories, "
             f"found {len(camera_dirs)}"
         )
 
@@ -379,7 +424,8 @@ def write_alignment(
         "force_load",
         "force_distance",
     ]
-    for camera_index in range(CAMERA_COUNT):
+    camera_count = len(camera_dirs)
+    for camera_index in range(camera_count):
         prefix = f"camera_{camera_index}"
         fieldnames.extend(
             (
@@ -401,7 +447,7 @@ def write_alignment(
         for video_index, capture_index in enumerate(sequence):
             camera_rows = [
                 camera_maps[index][capture_index]
-                for index in range(CAMERA_COUNT)
+                for index in range(camera_count)
             ]
             host_ns = int(
                 statistics.median(
@@ -511,17 +557,21 @@ def main():
     if not session.is_dir():
         raise SystemExit(f"Session does not exist: {session}")
     try:
-        camera_dirs, camera_maps, sequence = load_cameras(session)
-        if args.max_frames:
-            sequence = sequence[: args.max_frames]
-        sensor = load_sensor(session)
-        force = load_force(session)
         session_metadata_path = session / "session.json"
         session_metadata = (
             read_json(session_metadata_path)
             if session_metadata_path.is_file()
             else {}
         )
+        camera_count = expected_camera_count(
+            session, session_metadata, args.cameras
+        )
+        camera_dirs, camera_maps, sequence = load_cameras(session, camera_count)
+        print(f"Cameras: {camera_count} ({[d.name for d in camera_dirs]})")
+        if args.max_frames:
+            sequence = sequence[: args.max_frames]
+        sensor = load_sensor(session)
+        force = load_force(session)
         camera_metadata = sorted(
             session_metadata.get("camera_stats", []),
             key=lambda item: int(item.get("camera_index", 0)),
@@ -532,7 +582,7 @@ def main():
                 if index < len(camera_metadata)
                 else ""
             )
-            for index in range(CAMERA_COUNT)
+            for index in range(camera_count)
         ]
         ffmpeg = find_ffmpeg()
         first_images = [
@@ -593,6 +643,8 @@ def main():
         metadata_path = session / "multimodal_video_export.json"
         metadata = {
             "fps": args.fps,
+            "camera_count": camera_count,
+            "camera_directories": [directory.name for directory in camera_dirs],
             "frame_count": len(sequence),
             "capture_sequence_first": sequence[0],
             "capture_sequence_last": sequence[-1],

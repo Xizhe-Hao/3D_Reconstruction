@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Replay three cameras, a 16x16 tactile sensor, and force-gauge data."""
+"""Replay every capture camera, a 16x16 tactile sensor, and force-gauge data.
+
+The camera count is discovered from the session, so a rig with three, four, or
+more cameras replays without a code change. The camera previews are laid out on
+an automatically sized grid above the sensor and force panels.
+"""
 
 from __future__ import annotations
 
@@ -26,17 +31,26 @@ ROWS = 16
 COLS = 16
 CELL_COUNT = ROWS * COLS
 ADC_MAX = 255.0
-CAMERA_COUNT = 3
+MAX_CAMERAS_PER_PREVIEW_ROW = 4
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Replay three synchronized camera streams, the 16x16 sensor, "
+            "Replay the synchronized camera streams, the 16x16 sensor, "
             "and aligned IntelliMESUR force data."
         )
     )
     parser.add_argument("session", type=Path, help="Capture session directory")
+    parser.add_argument(
+        "--cameras",
+        type=int,
+        default=0,
+        help=(
+            "Expected camera count. 0 discovers it from the session "
+            "(export metadata, session.json, or camera_* directories)."
+        ),
+    )
     parser.add_argument(
         "--mode",
         choices=("change", "voltage", "relative-max"),
@@ -87,6 +101,8 @@ def parse_args():
         parser.error("--preview-width must be at least 160")
     if args.start_frame < 0:
         parser.error("--start-frame must be non-negative")
+    if args.cameras < 0:
+        parser.error("--cameras must be non-negative")
     return args
 
 
@@ -127,7 +143,48 @@ def select_sensor_path(session_dir, source):
     return selected
 
 
-def discover_camera_videos(session_dir):
+def camera_index_sort_key(path):
+    """Order camera_<index>_<serial> paths numerically, not alphabetically."""
+    parts = path.name.split("_")
+    try:
+        return (0, int(parts[1]), path.name)
+    except (IndexError, ValueError):
+        return (1, 0, path.name)
+
+
+def camera_directories(session_dir):
+    """Return camera_* directories ordered by their capture index."""
+    return sorted(
+        (path for path in session_dir.glob("camera_*") if path.is_dir()),
+        key=camera_index_sort_key,
+    )
+
+
+def resolve_camera_count(session_dir, requested):
+    """Decide how many cameras this session contains."""
+    if requested:
+        return requested
+    export_path = session_dir / "multimodal_video_export.json"
+    if export_path.is_file():
+        export_metadata = read_json(export_path)
+        if export_metadata.get("camera_count"):
+            return int(export_metadata["camera_count"])
+        if export_metadata.get("videos"):
+            return len(export_metadata["videos"])
+    session_path = session_dir / "session.json"
+    if session_path.is_file():
+        session_metadata = read_json(session_path)
+        if session_metadata.get("camera_count"):
+            return int(session_metadata["camera_count"])
+        if session_metadata.get("camera_serials"):
+            return len(session_metadata["camera_serials"])
+    found = len(camera_directories(session_dir))
+    if found < 1:
+        raise RuntimeError(f"No camera_* directories in {session_dir}")
+    return found
+
+
+def discover_camera_videos(session_dir, camera_count):
     metadata_path = session_dir / "multimodal_video_export.json"
     metadata = {}
     if metadata_path.is_file():
@@ -153,27 +210,31 @@ def discover_camera_videos(session_dir):
                 raise RuntimeError(f"Missing exported camera video: {name}")
             videos.append(path)
     else:
+        # No export metadata: fall back to a glob, ordered by camera index so
+        # that camera_10_* never sorts before camera_2_*.
         videos = []
         for root in search_roots:
-            videos = sorted(root.glob("camera_*_24fps.mp4"))
-            if len(videos) == CAMERA_COUNT:
+            candidates = sorted(
+                root.glob("camera_*fps*.mp4"),
+                key=camera_index_sort_key,
+            )
+            if len(candidates) == camera_count:
+                videos = candidates
                 break
 
-    if len(videos) != CAMERA_COUNT:
+    if len(videos) != camera_count:
         raise RuntimeError(
-            "Expected three exported camera MP4 files. Run "
-            "export_multimodal_mp4.py before replay."
+            f"Expected {camera_count} exported camera MP4 files, found "
+            f"{len(videos)}. Run export_multimodal_mp4.py before replay."
         )
     return videos, metadata
 
 
-def load_camera_timeline(session_dir):
-    camera_dirs = sorted(
-        path for path in session_dir.glob("camera_*") if path.is_dir()
-    )
-    if len(camera_dirs) != CAMERA_COUNT:
+def load_camera_timeline(session_dir, camera_count):
+    camera_dirs = camera_directories(session_dir)
+    if len(camera_dirs) != camera_count:
         raise RuntimeError(
-            f"Expected {CAMERA_COUNT} camera directories, found "
+            f"Expected {camera_count} camera directories, found "
             f"{len(camera_dirs)}"
         )
 
@@ -207,7 +268,9 @@ def load_camera_timeline(session_dir):
             timestamps.append(int(row["host_received_ns"]))
         camera_host_ns.append(timestamps)
 
-    video_paths, video_metadata = discover_camera_videos(session_dir)
+    video_paths, video_metadata = discover_camera_videos(
+        session_dir, camera_count
+    )
     video_frame_count = int(
         video_metadata.get("frame_count", sequence.size)
     )
@@ -220,15 +283,17 @@ def load_camera_timeline(session_dir):
     if video_fps <= 0:
         raise RuntimeError(f"Invalid MP4 frame rate: {video_fps}")
     source_info = video_metadata.get("source_image_info", [])
-    if len(source_info) != CAMERA_COUNT:
+    if len(source_info) != camera_count:
         source_info = [
             {"width": 2048, "height": 1536}
-            for _ in range(CAMERA_COUNT)
+            for _ in range(camera_count)
         ]
 
     camera_host_ns = np.asarray(camera_host_ns, dtype=np.int64)
     master_host_ns = np.median(camera_host_ns, axis=0).astype(np.int64)
     return {
+        "count": camera_count,
+        "directories": [path.name for path in camera_dirs],
         "names": [path.stem for path in video_paths],
         "videos": video_paths,
         "video_info": source_info,
@@ -251,7 +316,9 @@ def interpolate_sensor(raw_available, available_positions, policy):
     if policy == "blank":
         return result, estimated
 
-    missing = np.flatnonzero(~exact_positions)
+    missing = np.flatnonzero(~available_positions)
+    if missing.size == 0:
+        return result, estimated
     if policy == "nearest":
         insertions = np.searchsorted(available, missing)
         left = available[np.maximum(insertions - 1, 0)]
@@ -397,7 +464,8 @@ def load_session(session_dir, args):
     session_dir = session_dir.expanduser().resolve()
     if not session_dir.is_dir():
         raise RuntimeError(f"Session directory does not exist: {session_dir}")
-    cameras = load_camera_timeline(session_dir)
+    camera_count = resolve_camera_count(session_dir, args.cameras)
+    cameras = load_camera_timeline(session_dir, camera_count)
     sensor = load_sensor(
         session_dir,
         cameras["sequence"],
@@ -626,6 +694,13 @@ def validate_video_decoding(cameras, preview_width):
     print(f"MP4 decode check passed at frames: {indices}")
 
 
+def camera_grid_shape(camera_count):
+    """Rows and columns for the camera preview block."""
+    columns = min(camera_count, MAX_CAMERAS_PER_PREVIEW_ROW)
+    rows = -(-camera_count // columns)
+    return rows, columns
+
+
 class MultimodalReplay:
     BAR_MARGIN = 0.10
     FACE_SHADES = np.asarray((1.0, 0.78, 0.88, 0.70, 0.82), dtype=np.float32)
@@ -649,6 +724,7 @@ class MultimodalReplay:
         self.cmap = cmap
         self.norm = norm
         self.args = args
+        self.camera_count = session["cameras"]["count"]
         self.frame_count = session["cameras"]["sequence"].size
         self.fps = args.fps or session["fps"]
         self.current_frame = min(args.start_frame, self.frame_count - 1)
@@ -683,22 +759,35 @@ class MultimodalReplay:
         self.y1 = self.y0 + width
 
     def _build_figure(self):
-        self.fig = plt.figure(figsize=(17, 10))
+        preview_rows, preview_columns = camera_grid_shape(self.camera_count)
+        # Give the preview block more of the figure when the cameras wrap onto
+        # a second row, and grow the window instead of shrinking each preview.
+        figure_height = 10.0 + 2.6 * (preview_rows - 1)
+        preview_share = 0.72 + 0.62 * (preview_rows - 1)
+        self.fig = plt.figure(figsize=(17, figure_height))
         grid = self.fig.add_gridspec(
             2,
-            3,
-            height_ratios=(0.72, 1.28),
+            1,
+            height_ratios=(preview_share, 1.28),
             left=0.035,
             right=0.965,
-            top=0.95,
+            # Leave room above the previews so their per-camera titles do not
+            # collide with the figure-level frame counter.
+            top=0.925,
             bottom=0.14,
             hspace=0.14,
-            wspace=0.11,
         )
 
+        preview_grid = grid[0].subgridspec(
+            preview_rows,
+            preview_columns,
+            hspace=0.18,
+            wspace=0.06,
+        )
         self.image_artists = []
-        for camera_index in range(CAMERA_COUNT):
-            axis = self.fig.add_subplot(grid[0, camera_index])
+        for camera_index in range(self.camera_count):
+            row, column = divmod(camera_index, preview_columns)
+            axis = self.fig.add_subplot(preview_grid[row, column])
             preview = self.video_readers[camera_index].read(
                 self.current_frame
             )
@@ -707,12 +796,17 @@ class MultimodalReplay:
                 interpolation="nearest",
             )
             axis.set_title(
-                self.session["cameras"]["names"][camera_index], fontsize=10
+                f"[{camera_index}] "
+                f"{self.session['cameras']['names'][camera_index]}",
+                fontsize=9,
             )
             axis.set_axis_off()
             self.image_artists.append(artist)
 
-        self.ax3d = self.fig.add_subplot(grid[1, :2], projection="3d")
+        # A partly filled last preview row leaves blank cells; that is
+        # intentional and keeps every preview the same size.
+        data_grid = grid[1].subgridspec(1, 4, wspace=0.11)
+        self.ax3d = self.fig.add_subplot(data_grid[0, :3], projection="3d")
         initial = self.matrix_for_display(self.current_frame)
         faces, colors = self.build_bar_geometry(initial)
         self.bar_collection = Poly3DCollection(
@@ -765,7 +859,7 @@ class MultimodalReplay:
                         )
                     )
 
-        self._build_force_plot(grid)
+        self._build_force_plot(data_grid)
         self._build_controls()
         self.fig.canvas.mpl_connect("key_press_event", self.on_key_press)
         self.fig.canvas.mpl_connect("close_event", self.on_close)
@@ -773,8 +867,8 @@ class MultimodalReplay:
         self.timer.add_callback(self.on_timer)
         self.timer.start()
 
-    def _build_force_plot(self, grid):
-        self.force_axis = self.fig.add_subplot(grid[1, 2])
+    def _build_force_plot(self, data_grid):
+        self.force_axis = self.fig.add_subplot(data_grid[0, 3])
         self.distance_axis = self.force_axis.twinx()
         force = self.session["force"]
         self.force_cursor = None
@@ -982,8 +1076,10 @@ class MultimodalReplay:
         self.updating_slider = False
         self.fig.suptitle(
             f"Frame {index + 1}/{self.frame_count} | "
-            f"capture_sequence_index={sequence}",
+            f"capture_sequence_index={sequence} | "
+            f"{self.camera_count} cameras",
             fontsize=11,
+            y=0.985,
         )
         self.fig.canvas.draw_idle()
 
@@ -1124,12 +1220,14 @@ def print_summary(session, args):
     missing_count = int((~(sensor["exact"] | sensor["estimated"])).sum())
     print(f"Session: {session['session_dir']}")
     print(
-        f"Cameras: common={cameras['sequence'].size}, "
+        f"Cameras: count={cameras['count']}, "
+        f"common={cameras['sequence'].size}, "
         f"individual={cameras['per_camera_counts']}"
     )
+    print(f"Camera directories: {cameras['directories']}")
     print(
         f"Camera source: MP4 | frames="
-        f"{[cameras['video_frame_count']] * CAMERA_COUNT} | "
+        f"{[cameras['video_frame_count']] * cameras['count']} | "
         f"fps={cameras['video_fps']:.3f}"
     )
     print(

@@ -8,7 +8,7 @@ This repository consolidates the two prior codebases of our group into one place
 
 | Folder | Origin | Role in the project |
 |---|---|---|
-| [`sensor-data-collection/`](./sensor-data-collection) | [dfk0411/sensor-data-collection](https://github.com/dfk0411/sensor-data-collection) | **Real-world rig**: hardware firmware + synchronized multimodal data acquisition (tactile array + 3 cameras + force gauge) |
+| [`sensor-data-collection/`](./sensor-data-collection) | [dfk0411/sensor-data-collection](https://github.com/dfk0411/sensor-data-collection) | **Real-world rig**: hardware firmware + synchronized multimodal data acquisition (tactile array + 4 cameras + force gauge) |
 | [`DeformFieldBench/`](./DeformFieldBench) | [3365538768/DeformFieldBench](https://github.com/3365538768/DeformFieldBench) | **Simulation benchmark + models**: material-parameter estimation from deformation videos (training, evaluation, simulation) |
 
 ---
@@ -23,7 +23,7 @@ The overall research line of the group:
         │  sensor-data-collection  (this = data rig)  │   │  DeformFieldBench (benchmark+models) │
         │                                             │   │                                      │
         │  16x16 tactile array ──► INPUT signal       │   │  Taichi/Warp MPM simulation          │
-        │  3x FLIR cameras     ──► SHAPE ground truth │   │  ──► 3-view RGB deformation videos   │
+        │  4x FLIR cameras     ──► SHAPE ground truth │   │  ──► 3-view RGB deformation videos   │
         │  Mark-10 gauge       ──► FORCE ground truth │   │  ──► stress / flow / force fields    │
         │                                             │   │  ──► GT material params (E, nu,      │
         │  (synchronized, aligned capture sessions)   │   │       rho, sigma_y)                  │
@@ -36,7 +36,7 @@ The overall research line of the group:
 
 Two complementary lines:
 
-1. **Shape line (real world, tactile).** A flexible piezoresistive tactile array is attached to a soft object. Three externally-triggered cameras and a Mark-10 force gauge act as *training-time ground truth only*. The goal: after training, reconstruct the object's 3D deformation (and now: contact force) **from the tactile signal alone — no cameras at inference time** ("camera-free"). The published predecessor of this line is the zero-shot deformation reconstruction paper (flexible sensor array + cage-based 3D Gaussian modeling, arXiv:2603.19543).
+1. **Shape line (real world, tactile).** A flexible piezoresistive tactile array is attached to a soft object. Four externally-triggered cameras and a Mark-10 force gauge act as *training-time ground truth only*. The goal: after training, reconstruct the object's 3D deformation (and now: contact force) **from the tactile signal alone — no cameras at inference time** ("camera-free"). The published predecessor of this line is the zero-shot deformation reconstruction paper (flexible sensor array + cage-based 3D Gaussian modeling, arXiv:2603.19543).
 2. **Physics line (simulation, vision).** DeformFieldBench asks a deeper question: not "what shape is it?" but "**what is it made of?**" — inferring material parameters (Young's modulus `E`, Poisson's ratio `nu`, density `rho`, yield stress `sigma_y`) from three-view RGB deformation videos, using MPM simulation for data generation and ground truth.
 
 **Where this repository is heading:** force is the physical bridge between the two lines (material properties = the relationship between force and deformation). By adding calibrated force to the real-world rig, the shape line can grow from geometry reconstruction toward real-world, touch-based physical understanding.
@@ -50,7 +50,7 @@ Records **synchronized** data from three sources:
 | Stream | Hardware | Role |
 |---|---|---|
 | Tactile frames (16×16, 8-bit) | Velostat piezoresistive array, scanned by **Arduino Nano + dual CD74HC4067 multiplexers** | **Model input** (the only stream that remains at deployment) |
-| Video (3 views) | 3× Teledyne FLIR **Blackfly S USB3** (PySpin / Spinnaker SDK) | **Shape ground truth** (training only) |
+| Video (4 views) | 4× Teledyne FLIR **Blackfly S USB3** (PySpin / Spinnaker SDK) | **Shape ground truth** (training only) |
 | Force curve | **Mark-10** force gauge + IntelliMESUR tablet (CSV via email) | **Force ground truth** (training only) |
 
 ### 2.1 Hardware (`Arduino files/`)
@@ -58,7 +58,7 @@ Records **synchronized** data from three sources:
 - **`MatrixArrayDual4067Binary.ino`** — the one firmware to flash (Arduino Nano, ATmega328P).
   - Scans the 16×16 array through two CD74HC4067 muxes: row address pins **D4–D7** (inhibit **D8**), column address pins **A1–A4** (inhibit **A5**).
   - Streams binary frames over serial at **500000 baud**: magic `M16B`, version, dimensions, 8-bit ADC payload (256 bytes, row-major), frame index, device timestamp, 16-bit checksum.
-  - **Camera sync**: emits a 100 µs rising-edge pulse on **D9** — wired to the hardware-trigger input of *all three* cameras. This pulse is what makes the three videos and the tactile stream line up. Cameras must be configured for external hardware trigger.
+  - **Camera sync**: emits a 100 µs rising-edge pulse on **D9** — wired in parallel to the hardware-trigger input of *every* camera (currently four). This pulse is what makes the videos and the tactile stream line up. Cameras must be configured for external hardware trigger. Adding a camera is a wiring change only; the firmware is unchanged.
 
 ### 2.2 Acquisition software (`Python files/`)
 
@@ -76,7 +76,7 @@ Records **synchronized** data from three sources:
 
 1. Python 3.10 (64-bit), Spinnaker SDK 4.3.0.190 + matching Teledyne PySpin wheel, NumPy 1.26.4.
 2. Flash `Arduino files/MatrixArrayDual4067Binary.ino` (board: Arduino Nano; if upload fails, try the *Old Bootloader* processor option). Note the COM port.
-3. Verify D9 reaches all three camera trigger inputs; confirm each camera streams in SpinView, then **close SpinView**.
+3. Verify D9 reaches all four camera trigger inputs; confirm each camera streams in SpinView, then **close SpinView**. (Different camera count? Add `--cameras N` in step 5.)
 4. ```powershell
    py -3.10 -m venv .venv
    .\.venv\Scripts\Activate.ps1
@@ -142,12 +142,12 @@ Full details: [`DeformFieldBench/README.md`](./DeformFieldBench/README.md) (orig
 **Roles of each stream, stated once and precisely:**
 
 - The **tactile array is the input** — the only sensor that remains at deployment. "Camera-free" means *no cameras at inference*; cameras supervise training only.
-- The **three cameras are the shape answer key** (multi-view triangulation; consumer RGB-D was rejected because its depth precision cannot resolve millimeter-level soft-body deformation on a textureless surface).
+- The **cameras are the shape answer key** (multi-view triangulation; consumer RGB-D was rejected because its depth precision cannot resolve millimeter-level soft-body deformation on a textureless surface). The rig grew from three views to four to improve triangulation coverage.
 - The **Mark-10 is the force answer key** — the new stream this project adds on top of the published shape-only work.
 
 **Next-stage direction (why this consolidation exists):**
 
-1. Reproduce the 3-camera + tactile capture (Section 2) and the shape-reconstruction result of the predecessor paper.
+1. Reproduce the multi-camera + tactile capture (Section 2, now 4 views) and the shape-reconstruction result of the predecessor paper.
 2. Add force: train *tactile → shape + contact force*, keeping the camera-free / zero-shot properties.
 3. Bridge to the physics line: with measured force + reconstructed deformation, move toward real-world material/physical understanding — the question DeformFieldBench answers in simulation — and toward robot applications (force-aware soft grippers, contact-rich data collection for embodied AI).
 

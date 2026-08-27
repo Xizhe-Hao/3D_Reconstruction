@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Capture three Blackfly S cameras, M16B sensor data, and force exports.
+"""Capture four Blackfly S cameras, M16B sensor data, and force exports.
 
 The cameras are configured and armed first. Python then performs a serial
 READY/START/ACK handshake with the Arduino. Every Arduino sensor scan produces
 one rising-edge camera trigger followed by one M16B sensor frame. IntelliMESUR
 continues to own its serial port; this program watches its automatic CSV export
 folder and aligns each exported force run to the tactile stream afterward.
+
+The rig now uses four cameras, but the camera count is not hard-coded: use
+--cameras N to capture a different number. The single Arduino D9 trigger line
+must reach the OPTOIN input of every connected camera.
 """
 
 from __future__ import annotations
@@ -58,7 +62,7 @@ COMMAND_STOP = b"M16_STOP\n"
 
 DEFAULT_PORT = "COM6"
 DEFAULT_BAUD = 500_000
-EXPECTED_CAMERA_COUNT = 3
+DEFAULT_CAMERA_COUNT = 4
 COLOR_PIXEL_FORMAT_PREFIXES = (
     "Bayer",
     "RGB",
@@ -150,7 +154,7 @@ class ForceExportRecord:
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Synchronously capture three Blackfly S cameras and a 16x16 "
+            "Synchronously capture four Blackfly S cameras and a 16x16 "
             "M16B tactile sensor stream."
         )
     )
@@ -180,10 +184,23 @@ def parse_args():
         help="Camera trigger input line, normally Line0 for OPTOIN.",
     )
     parser.add_argument(
+        "--cameras",
+        type=int,
+        default=DEFAULT_CAMERA_COUNT,
+        help=(
+            "Number of Blackfly S cameras that must be present. The rig "
+            f"currently uses {DEFAULT_CAMERA_COUNT}; every camera needs the "
+            "Arduino D9 trigger pulse on its OPTOIN input."
+        ),
+    )
+    parser.add_argument(
         "--camera-serials",
-        nargs=EXPECTED_CAMERA_COUNT,
-        metavar=("CAM0", "CAM1", "CAM2"),
-        help="Optional camera serial numbers in the desired output order.",
+        nargs="+",
+        metavar="SERIAL",
+        help=(
+            "Optional camera serial numbers in the desired output order. "
+            "Supply exactly --cameras values."
+        ),
     )
     parser.add_argument(
         "--frames",
@@ -411,6 +428,15 @@ def parse_args():
 
     if args.frames < 0:
         parser.error("--frames must be non-negative")
+    if args.cameras < 1:
+        parser.error("--cameras must be at least 1")
+    if args.camera_serials and len(args.camera_serials) != args.cameras:
+        parser.error(
+            f"--camera-serials expects {args.cameras} serial numbers, "
+            f"received {len(args.camera_serials)}"
+        )
+    if args.camera_serials and len(set(args.camera_serials)) != args.cameras:
+        parser.error("--camera-serials must not repeat a serial number")
     if args.minimum_free_gb < 0:
         parser.error("--minimum-free-gb must be non-negative")
     if (
@@ -668,11 +694,12 @@ def initialize_cameras(args):
     system = PySpin.System.GetInstance()
     camera_list = system.GetCameras()
     count = camera_list.GetSize()
-    if count != EXPECTED_CAMERA_COUNT:
+    if count != args.cameras:
         camera_list.Clear()
         system.ReleaseInstance()
         raise RuntimeError(
-            f"Expected {EXPECTED_CAMERA_COUNT} cameras, found {count}"
+            f"Expected {args.cameras} cameras, found {count}. Check the USB3 "
+            "connections, or pass --cameras to match the rig."
         )
 
     cameras_by_serial = {}
@@ -2078,6 +2105,8 @@ def save_session_metadata(
         "serial_rx_buffer_bytes": args.serial_rx_buffer,
         "sensor_queue_frames": args.sensor_queue_frames,
         "trigger_source": args.trigger_source,
+        "camera_count": len(serial_numbers),
+        "requested_camera_count": args.cameras,
         "camera_serials": serial_numbers,
         "image_format": args.image_format,
         "color_requested": args.color,
@@ -2168,9 +2197,20 @@ def main():
     disk_usage = shutil.disk_usage(output_root)
     free_gb = disk_usage.free / 1024**3
     print(
-        f"Capture storage: {output_root} | free={free_gb:.1f} GiB",
+        f"Capture storage: {output_root} | free={free_gb:.1f} GiB | "
+        f"cameras={args.cameras}",
         flush=True,
     )
+    if not args.no_save_images:
+        # 2048x1536 raw Bayer BMP is about 3 MiB per frame per camera. Adding a
+        # camera raises the sustained write load proportionally, so print the
+        # requirement before the run rather than discovering it as frame loss.
+        estimated_mb_per_s = args.cameras * 3.0 * 24.0
+        print(
+            f"Estimated sustained write load at 24 fps: "
+            f"~{estimated_mb_per_s:.0f} MiB/s across {args.cameras} cameras",
+            flush=True,
+        )
     if (
         not args.no_save_images
         and args.minimum_free_gb > 0
@@ -2204,7 +2244,7 @@ def main():
     sensor_reader_done = threading.Event()
     camera_stats = []
     sensor_last_activity = [0.0]
-    camera_last_activity = [0.0] * EXPECTED_CAMERA_COUNT
+    camera_last_activity = [0.0] * args.cameras
     workers = []
     stopped_normally = False
     force_records = []
@@ -2258,7 +2298,7 @@ def main():
             camera.BeginAcquisition()
             acquisition_started.append(camera)
         wait_for_cameras_armed(cameras)
-        print("All three cameras are acquiring and armed.")
+        print(f"All {len(cameras)} cameras are acquiring and armed.")
 
         for camera, stats in zip(cameras, camera_stats):
             worker = threading.Thread(
@@ -2430,8 +2470,9 @@ def main():
         if stopped_normally and camera_stats:
             # STOP can arrive while the Arduino is scanning. In that case it
             # completes and triggers one final frame before processing STOP on
-            # the next loop. Wait until all four receiver counts have stopped
-            # changing so that this in-flight frame is not cut off unevenly.
+            # the next loop. Wait until every receiver count (the sensor plus
+            # each camera) has stopped changing so that this in-flight frame is
+            # not cut off unevenly.
             print("Draining the final in-flight frame...")
             deadline = time.monotonic() + args.drain_timeout
             stable_since = time.monotonic()

@@ -147,14 +147,20 @@ def write_repaired(session, args):
 
 
 def common_camera_timeline(session):
+    # Any camera count is accepted; the filled timeline is the intersection of
+    # every camera's complete frames, so it adapts when a camera is added.
     camera_dirs = sorted(
         path for path in session.glob("camera_*") if path.is_dir()
     )
-    if len(camera_dirs) != 3:
-        raise RuntimeError("Expected three camera directories")
+    if not camera_dirs:
+        raise RuntimeError(f"No camera_* directories in {session}")
+    print(f"Camera timeline sources: {[d.name for d in camera_dirs]}")
     camera_maps = []
     for camera_dir in camera_dirs:
-        rows = read_csv(camera_dir / "frames.csv")
+        frame_log = camera_dir / "frames.csv"
+        if not frame_log.is_file():
+            raise RuntimeError(f"Missing camera frame log: {frame_log}")
+        rows = read_csv(frame_log)
         camera_maps.append(
             {
                 int(row["capture_sequence_index"]): int(row["host_received_ns"])

@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 
-CAMERA_COUNT = 3
+DEFAULT_CAMERA_COUNT = 4
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "captures"
 DEFAULT_PORT = "COM6"
 DEFAULT_BAUD = 500_000
@@ -21,7 +21,7 @@ IMAGE_SUFFIXES = {".bmp", ".png", ".tif", ".tiff", ".jpg", ".jpeg", ".raw"}
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Capture three Blackfly S cameras and a 16x16 tactile sensor, "
+            "Capture four Blackfly S cameras and a 16x16 tactile sensor, "
             "then repair, export, verify, and clean the session."
         )
     )
@@ -43,10 +43,22 @@ def parse_args():
         help="Arduino serial baud rate.",
     )
     parser.add_argument(
+        "--cameras",
+        type=int,
+        default=DEFAULT_CAMERA_COUNT,
+        help=(
+            "Number of Blackfly S cameras on the rig "
+            f"(default {DEFAULT_CAMERA_COUNT})."
+        ),
+    )
+    parser.add_argument(
         "--camera-serials",
-        nargs=CAMERA_COUNT,
-        metavar=("CAM0", "CAM1", "CAM2"),
-        help="Optional camera serial numbers in the desired output order.",
+        nargs="+",
+        metavar="SERIAL",
+        help=(
+            "Optional camera serial numbers in the desired output order. "
+            "Supply exactly --cameras values."
+        ),
     )
     parser.add_argument(
         "--frames",
@@ -92,6 +104,13 @@ def parse_args():
     args = parser.parse_args()
     if args.frames < 0:
         parser.error("--frames must be non-negative")
+    if args.cameras < 1:
+        parser.error("--cameras must be at least 1")
+    if args.camera_serials and len(args.camera_serials) != args.cameras:
+        parser.error(
+            f"--camera-serials expects {args.cameras} serial numbers, "
+            f"received {len(args.camera_serials)}"
+        )
     if args.baud <= 0:
         parser.error("--baud must be positive")
     if args.fps <= 0:
@@ -170,7 +189,7 @@ def capture_sessions(output):
     }
 
 
-def load_valid_video_export(session):
+def load_valid_video_export(session, camera_count):
     metadata_path = session / "multimodal_video_export.json"
     if not metadata_path.is_file():
         return None
@@ -182,8 +201,8 @@ def load_valid_video_export(session):
     ]
     if (
         frame_count < 1
-        or len(videos) != CAMERA_COUNT
-        or len(decoded) != CAMERA_COUNT
+        or len(videos) != camera_count
+        or len(decoded) != camera_count
         or any(value != frame_count for value in decoded)
         or any(not path.is_file() for path in videos)
         or not (session / "multimodal_video_alignment.csv").is_file()
@@ -192,15 +211,15 @@ def load_valid_video_export(session):
     return metadata
 
 
-def camera_image_paths(session):
+def camera_image_paths(session, camera_count):
     session_resolved = session.resolve()
     paths = set()
     camera_dirs = sorted(
         path for path in session.glob("camera_*") if path.is_dir()
     )
-    if len(camera_dirs) != CAMERA_COUNT:
+    if len(camera_dirs) != camera_count:
         raise RuntimeError(
-            f"Expected {CAMERA_COUNT} camera directories, "
+            f"Expected {camera_count} camera directories, "
             f"found {len(camera_dirs)}"
         )
     for camera_dir in camera_dirs:
@@ -225,14 +244,14 @@ def camera_image_paths(session):
     return sorted(paths)
 
 
-def clean_source_images(session):
-    metadata = load_valid_video_export(session)
+def clean_source_images(session, camera_count):
+    metadata = load_valid_video_export(session, camera_count)
     if metadata is None:
         raise RuntimeError(
             "Source images cannot be deleted because MP4 verification "
             "metadata is missing or invalid"
         )
-    paths = camera_image_paths(session)
+    paths = camera_image_paths(session, camera_count)
     total_bytes = sum(path.stat().st_size for path in paths)
     print(
         f"\n[cleanup] verified outputs; deleting {len(paths)} source images "
@@ -274,6 +293,8 @@ def main():
         args.port,
         "--baud",
         str(args.baud),
+        "--cameras",
+        str(args.cameras),
     ]
     if args.frames:
         capture_command.extend(("--frames", str(args.frames)))
@@ -331,11 +352,13 @@ def main():
             args.preset,
             "--crf",
             str(args.crf),
+            "--cameras",
+            str(args.cameras),
             "--overwrite",
         ],
         script_dir,
     )
-    if load_valid_video_export(session) is None:
+    if load_valid_video_export(session, args.cameras) is None:
         raise RuntimeError(
             "Video export returned success but verification metadata "
             "is incomplete"
@@ -344,7 +367,7 @@ def main():
     if args.keep_bmp:
         print("\n[cleanup] --keep-bmp selected; source images retained")
     else:
-        clean_source_images(session)
+        clean_source_images(session, args.cameras)
 
     print(
         "\nCamera/sensor processing completed. Import the corresponding "

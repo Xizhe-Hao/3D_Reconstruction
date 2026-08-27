@@ -3,8 +3,13 @@
 This project records synchronized data from:
 
 - one 16x16 tactile sensor;
-- three Teledyne Blackfly S USB3 cameras; and
+- four Teledyne Blackfly S USB3 cameras; and
 - one Mark-10 force gauge running IntelliMESUR on its own tablet.
+
+The camera count is not hard-coded. Four is the default everywhere; pass
+`--cameras N` to capture with a different number. Post-processing and replay
+read the count back from the capture session, so sessions recorded with three
+cameras still repair, export, and replay unchanged.
 
 The workflow has two stages:
 
@@ -39,11 +44,24 @@ Official references:
 1. Install 64-bit Python 3.10.
 2. Install the full 64-bit Spinnaker SDK, including SpinView and USB3 camera
    drivers.
-3. Connect all three cameras.
+3. Connect all four cameras.
 4. Open SpinView and confirm that every camera can stream.
 5. Exit SpinView before starting Python acquisition.
 
 SpinView and PySpin should not access the same camera simultaneously.
+
+### 1.2.1 USB3 Bandwidth for Four Cameras
+
+Four full-resolution cameras need more USB3 bandwidth and more sustained disk
+write throughput than three. Before the first four-camera trial:
+
+- put the cameras on separate USB3 host controllers where possible; two
+  cameras sharing one controller can drop frames that three cameras never did;
+- keep `--output` on a fast drive. Raw Bayer BMP at 2048x1536 and 24 fps costs
+  roughly 72 MiB/s per camera, so four cameras need about 290 MiB/s sustained.
+  The capture program prints this estimate at startup; and
+- if `incomplete_images` or `dropped_images` appear in `session.json` for the
+  newly added camera only, suspect the USB3 controller before the sensor.
 
 ### 1.3 Create the Python Environment
 
@@ -80,8 +98,10 @@ python -m pip install "path\to\your\pyspin\wheel\file"
 
 Before every trial:
 
-- connect the Arduino, sensor, and three cameras;
-- verify that D9 reaches all three rising-edge camera trigger inputs;
+- connect the Arduino, sensor, and all four cameras;
+- verify that D9 reaches all four rising-edge camera trigger inputs. The same
+  D9 pulse is wired in parallel to every camera; the firmware needs no change
+  when a camera is added;
 - close SpinView;
 - zero the force gauge;
 - prepare one IntelliMESUR run on the tablet;
@@ -111,7 +131,12 @@ Replace `COM7` with the Arduino port shown in Device Manager. By default,
 captures are stored in the project's `captures` folder.
 
 Camera serial numbers are detected and sorted automatically. To force a
-specific camera order, add `--camera-serials CAM0 CAM1 CAM2`.
+specific camera order, add `--camera-serials CAM0 CAM1 CAM2 CAM3` — supply
+exactly as many serial numbers as there are cameras.
+
+The workflow expects four cameras and stops if a different number is found.
+To run a different rig, add `--cameras N`, for example `--cameras 3` to repeat
+an old three-camera setup.
 
 To store data elsewhere, add `--output`, followed by the destination folder.
 The folder can be dragged directly from File Explorer into the terminal.
@@ -127,8 +152,9 @@ Then:
 7. press `Ctrl+C` once; and
 8. wait for MP4 generation and verified BMP cleanup.
 
-Stage A is complete after all three color MP4 files have been verified and the
-terminal prints the new capture session folder.
+Stage A is complete after all four color MP4 files have been verified and the
+terminal prints the new capture session folder. One MP4 is written per camera,
+named after its `camera_<index>_<serial>` folder.
 
 ### 2.3 Stage B: Import the Emailed Force CSV
 
@@ -157,4 +183,10 @@ To check the synchronized videos, sensor, and force data, run:
 ```powershell
 python replay_capture_multimodal.py "path\to\your\capture\session\folder"
 ```
+
+The replay window shows one preview per camera along the top row, with the
+3D sensor surface and the force curve below. Up to four cameras share a single
+preview row; beyond that the previews wrap onto additional rows and the window
+grows taller. Each preview is labelled with its camera index, so `[3]` is the
+fourth camera.
 

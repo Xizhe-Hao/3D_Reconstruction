@@ -14,7 +14,9 @@
 //   E/#INH -> A5 (LOW = enabled)
 //
 // Camera trigger:
-//   D9 -> external trigger driver/input
+//   D9 -> external trigger driver/input, wired in parallel to the OPTOIN of
+//   every camera (the rig currently uses four). One pulse triggers all of
+//   them, so adding or removing a camera needs no firmware change.
 //   A rising-edge pulse is emitted after all 256 cells are sampled.
 //   Each sensor frame is transmitted once before and once after the trigger.
 //   Both copies have the same frame index and checksum; the host keeps the
