@@ -4,6 +4,7 @@ __pycache__/
 *.pyo
 .venv/
 venv/
+.venv-calib/
 *.egg-info/
 
 # Data & captures (never commit large data)
@@ -30,3 +31,14 @@ Thumbs.db
 # Logs
 *.log
 wandb/
+
+# Bench-tool snapshots from test/live_sensor_2d.py and live_sensor_3d.py
+sensor-data-collection/test/sensor_2d_*.png
+sensor-data-collection/test/sensor_3d_*.png
+
+# Calibration intermediates (board images, detections, per-session results).
+# calibration.json and board.json are small and SHOULD be committed.
+calibration/board/*.png
+calibration/board/*.pdf
+detections.npz
+detections.json

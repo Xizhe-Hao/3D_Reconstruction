@@ -1,0 +1,9 @@
+{
+  "squares_x": 18,
+  "squares_y": 16,
+  "square_mm": 6.0,
+  "marker_mm": 4.5,
+  "dictionary": "DICT_4X4_250",
+  "legacy_pattern": false,
+  "note": "printer scaled 0.75x; square measured 6.0 mm; on the 153x305 mm glass"
+}

@@ -1,0 +1,19 @@
+# Calibration environment -- keep this SEPARATE from the capture environment.
+#
+# cv2.calibrateMultiview exists only in OpenCV 5.x, and the OpenCV 5 wheel
+# requires numpy>=2, while PySpin/Spinnaker needs numpy 1.x. Calibration is
+# offline post-processing of saved BMPs and never talks to the camera SDK, so
+# the two environments have no reason to share.
+#
+#   py -3.10 -m venv .venv-calib
+#   .\.venv-calib\Scripts\Activate.ps1
+#   python -m pip install -r calibration/requirements.txt
+#
+# ArUco is part of OpenCV's main objdetect module since 4.7 --
+# opencv-contrib-python is NOT required.
+
+opencv-python==5.0.0.93
+numpy>=2.0
+pillow>=10.0          # exact print scale (DPI metadata) for the board PDF/PNG
+scipy>=1.11           # sparse bundle adjustment in bundle.py
+matplotlib>=3.8       # validate.py --plots

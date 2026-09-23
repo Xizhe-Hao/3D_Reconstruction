@@ -69,7 +69,8 @@ Records **synchronized** data from three sources:
 | `repair_sensor_session.py` | Detects/repairs corrupted tactile frames in a session |
 | `export_multimodal_mp4.py` | Converts captured frames to synchronized color MP4s, verifies, cleans up BMPs |
 | `align_force_curve_only.py` | **Stage B.** Aligns the emailed Mark-10 CSV to the session using *curve-shape matching* between the force curve and the tactile signal (timestamps are ignored). Prints `score` / `confidence` / `peak_margin` |
-| `replay_capture_multimodal.py` | Replays a session to visually verify synchronization |
+| `replay_capture_2d.py` | **Verification view.** Replays a session with a 2D top-down tactile image beside the camera previews and force curve; marks the contact patch and flags baseline drift |
+| `replay_capture_multimodal.py` | Same replay with a 3D bar panel. Better for judging relative depth or demoing; its z-axis is voltage, not displacement |
 | `requirements.txt` | Python deps (PySpin installed separately from the Teledyne wheel) |
 
 ### 2.3 Quick start (Windows, tested config)
@@ -85,7 +86,7 @@ Records **synchronized** data from three sources:
    ```
 5. **Stage A** — capture: `python run_multimodal_workflow.py --port COM7` → baseline ≈1 s → run IntelliMESUR + perform the press/bend action → baseline ≈1 s → `Ctrl+C` → wait for MP4 verification.
 6. **Stage B** — force import: `python align_force_curve_only.py <session folder> <force csv>` (prefer `confidence=high`).
-7. Verify: `python replay_capture_multimodal.py <session folder>`.
+7. Verify: `python replay_capture_2d.py <session folder>` (2D tactile image; use `replay_capture_multimodal.py` for the 3D bar view).
 
 Full details: [`sensor-data-collection/README.md`](./sensor-data-collection/README.md) (original, unmodified).
 

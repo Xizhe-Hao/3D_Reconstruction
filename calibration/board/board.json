@@ -1,0 +1,9 @@
+{
+  "squares_x": 11,
+  "squares_y": 15,
+  "square_mm": 9.0,
+  "marker_mm": 6.75,
+  "dictionary": "DICT_4X4_100",
+  "legacy_pattern": false,
+  "note": "for the 116 x 178 mm glass plate; page 113 x 171 mm -- PRINT AT 100%, then measure a square and put the measured value here"
+}

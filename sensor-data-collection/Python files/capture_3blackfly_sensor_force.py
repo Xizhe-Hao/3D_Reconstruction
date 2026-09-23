@@ -526,11 +526,15 @@ def set_float(nodemap, node_name, value, required=True):
         return None
 
     clamped = min(max(float(value), node.GetMin()), node.GetMax())
-    increment = node.GetInc()
-    if increment > 0:
-        clamped = node.GetMin() + round(
-            (clamped - node.GetMin()) / increment
-        ) * increment
+    # A GenICam float node only exposes an increment when it declares one.
+    # Blackfly S ExposureTime does not, and calling GetInc() on it raises
+    # "node does not have an increment" instead of returning 0.
+    if node.HasInc():
+        increment = node.GetInc()
+        if increment > 0:
+            clamped = node.GetMin() + round(
+                (clamped - node.GetMin()) / increment
+            ) * increment
     node.SetValue(clamped)
     return clamped
 

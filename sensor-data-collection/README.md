@@ -181,12 +181,163 @@ prints its alignment score.
 To check the synchronized videos, sensor, and force data, run:
 
 ```powershell
-python replay_capture_multimodal.py "path\to\your\capture\session\folder"
+python replay_capture_2d.py "path\to\your\capture\session\folder"
 ```
 
 The replay window shows one preview per camera along the top row, with the
-3D sensor surface and the force curve below. Up to four cameras share a single
+tactile image and the force curve below. Up to four cameras share a single
 preview row; beyond that the previews wrap onto additional rows and the window
 grows taller. Each preview is labelled with its camera index, so `[3]` is the
 fourth camera.
 
+**Use the 2D view to check a capture.** A top-down image lines up directly with
+the camera previews above it, nothing is hidden behind anything else, and cell
+addresses are immediate. It also marks the contact patch: `×` is the peak cell
+and `○` the contact centroid, so "the indenter is here, the signal is there" is
+one glance. Note that the colour scale is sized from the session's own signal
+unless you pass `--range`.
+
+Two things the 2D view is good at catching:
+
+- **Baseline drift.** If the title says the contact covers over half the array,
+  the whole sensor has moved away from the baseline taken at the start of the
+  run, and the centroid is meaningless. Re-check the unloaded period.
+- **Bad rows or columns.** A dead or offset line shows as a solid stripe along
+  one edge instead of a wall of bars hiding everything behind it.
+
+Useful options: `--labels` for per-cell values, `--no-smooth` for raw cells,
+`--range` for a fixed colour scale, and `--mode voltage` for absolute voltage.
+Keys: `space` play/pause, arrows step, `m` markers, `i` smoothing, `q` quit.
+
+#### Exporting the view as a video
+
+The replay windows are viewers and save nothing on their own. To get a file of
+the whole view — camera previews, tactile image, force curve, contact markers —
+add `--export`. No window opens; it renders offscreen and encodes with the
+bundled FFmpeg.
+
+```powershell
+python replay_capture_2d.py "会话文件夹" --export clip.mp4 --export-range 42 49
+python replay_capture_2d.py "会话文件夹" --export clip.gif --export-fps 8 --export-dpi 60
+python replay_capture_2d.py "会话文件夹" --export whole_run.mp4
+```
+
+The extension picks the format: `.mp4` for archiving, `.gif` for slides and
+chat. Options:
+
+| Option | Meaning |
+|---|---|
+| `--export-range START_S END_S` | Export only this span of capture time |
+| `--export-fps` | Output rate, sampled from the capture timeline so playback is real-time (default 12) |
+| `--export-dpi` | Resolution; the figure is 17 in wide, so 80 → 1360 px (default 80) |
+
+Rendering costs roughly **0.3 s per output frame**, because each frame decodes
+four camera streams and redraws the whole figure. Measured on this workstation:
+7 s of capture at 12 fps took 28 s. A whole 57 s session at 12 fps is about 4
+minutes. Prefer `--export-range` around the event of interest.
+
+Note that the sensor panel shows whatever the data says, so if the array has
+open cells they appear in the video too. Fix the data before exporting anything
+you plan to show.
+
+### 2.5 The 3D View
+
+The original replay is still there and takes the same arguments:
+
+```powershell
+python replay_capture_multimodal.py "path\to\your\capture\session\folder"
+```
+
+Bar height is a second visual channel for magnitude, which helps when judging
+relative depth or showing the rig to someone. Prefer it for that; prefer the 2D
+view for verifying a capture. Be aware that the z-axis is **voltage, not
+displacement** — the mapping from one to the other is what this project is
+trying to learn, so the height is not a deformation profile.
+
+Both replays share their session loading, camera decoding, force panel, and
+playback controls: `replay_capture_2d.py` imports them from
+`replay_capture_multimodal.py`, so keep the two files in the same folder.
+
+## 3. Bench Tools (`test/`)
+
+Standalone sensor-only diagnostics. They need no cameras, no force gauge, and
+no capture session — just the Arduino. Run them from the `test` folder with the
+same virtual environment. None of them writes into a capture session; they only
+read the sensor.
+
+### 3.1 `live_sensor_2d.py` — Live 2D Pressure Image
+
+Shows the array as a smooth 2D image using the same signal definition as the
+capture pipeline (`V_sensor = Vdrive - V_adc`, then baseline subtraction), so
+what looks right here looks the same in `replay_capture_multimodal.py`.
+
+```powershell
+python live_sensor_2d.py --list-ports          # find the Arduino COM port
+python live_sensor_2d.py COM3                  # baseline-subtracted (default)
+python live_sensor_2d.py COM3 --mode voltage   # absolute sensor voltage
+python live_sensor_2d.py COM3 --mode raw       # raw 8-bit ADC
+python live_sensor_2d.py --simulate            # no hardware, synthetic press
+python live_sensor_2d.py --selftest            # headless render check, saves a PNG
+```
+
+Keep the sensor unloaded for the first second: the tool medians the first 24
+frames into the no-load baseline before it starts showing contact.
+
+| Key | Action |
+|---|---|
+| `b` | re-capture the no-load baseline |
+| `i` | toggle smooth / raw-cell rendering |
+| `v` | toggle per-cell value labels |
+| `+` / `-` | display gain up / down |
+| `]` / `[` | display range up / down |
+| `s` | save a PNG snapshot |
+| `q` or `Esc` | quit |
+
+Useful options: `--gain` and `--range` for weak signals, `--rot90 N`,
+`--flip-ud`, `--flip-lr` to orient the image to the physical sensor, and
+`--contact-threshold` to tune contact detection.
+
+### 3.2 `live_sensor_3d.py` — Live 3D Bar View
+
+The bench counterpart of the 3D panel in `replay_capture_multimodal.py`: same
+signal definition, same bar geometry and shading, but fed live from the
+Arduino. Use it to judge the deformation shape before a full capture.
+
+```powershell
+python live_sensor_3d.py COM3                  # 3D bars, baseline-subtracted
+python live_sensor_3d.py COM3 --style surface  # smooth surface, ~2x faster
+python live_sensor_3d.py --simulate            # no hardware, synthetic press
+python live_sensor_3d.py --selftest            # headless render + timing report
+```
+
+3D redraws are much slower than the sensor's 24 Hz: measured on this
+workstation, `bars` sustains about 8 fps and `surface` about 13 fps. That is a
+*display* limit only — acquisition still runs at full rate and the viewer always
+shows the newest frame, dropping intermediate ones. Use `--style surface` or
+`--max-render-fps` if the window feels sluggish. For a fluid view of the
+contact patch, prefer the 2D tool; use the 3D one to read deformation depth.
+
+| Key | Action |
+|---|---|
+| `b` | re-capture the no-load baseline |
+| `r` | toggle slow auto-rotation |
+| `t` | toggle bars / surface |
+| `0` | reset the viewing angle |
+| `+` / `-` | display gain up / down |
+| `]` / `[` | display range up / down |
+| `s` | save a PNG snapshot |
+| `q` or `Esc` | quit |
+
+Drag with the mouse to orbit at any time. It shares `--mode`, `--gain`,
+`--range`, `--rot90`, `--flip-ud`, and `--flip-lr` with the 2D tool, and imports
+the serial protocol from `live_sensor_2d.py`, so keep the two files together.
+
+### 3.3 `livesensor_view.py` — Minimal ADC Heatmap
+
+A smaller viewer that plots the raw 8-bit ADC map with no baseline handling.
+Use it to confirm the serial link and firmware are alive:
+
+```powershell
+python livesensor_view.py COM3
+python livesensor_view.py COM3 --raw    # also print per-frame stats
+```
