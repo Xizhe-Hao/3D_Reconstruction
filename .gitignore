@@ -14,7 +14,6 @@ outputs/
 output_checkpoints/
 *.npz
 *.h5
-!DeformFieldBench/simulation/mpm_solver_warp/sand_column.h5
 *.pt
 *.pth
 *.ckpt
@@ -42,3 +41,13 @@ calibration/board/*.png
 calibration/board/*.pdf
 detections.npz
 detections.json
+
+# Reconstruction (MVTracker + DUSt3R): local session copies, model weights,
+# Rerun recordings and per-frame point clouds. outputs/ is covered above.
+reconstruction/data/
+reconstruction/submodule/MoGe/
+**/checkpoints/
+*.safetensors
+*.onnx
+*.rrd
+*.ply

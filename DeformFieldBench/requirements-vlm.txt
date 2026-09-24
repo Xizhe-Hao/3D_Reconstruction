@@ -1,4 +1,0 @@
-dashscope
-openai
-opencv-python-headless
-numpy
