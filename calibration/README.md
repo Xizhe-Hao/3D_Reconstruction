@@ -165,8 +165,9 @@ useful for a minute of practice first.
 
 ### The manual way
 
-Call the capture script directly (never `run_multimodal_workflow.py`: it does not
-forward `--exposure-us`, and it deletes the BMPs unless you remember `--keep-bmp`).
+Call the capture script directly. (The `run_multimodal_workflow.py` wrapper that
+used to sit in front of it has been removed — it did not forward `--exposure-us`
+and it deleted the BMPs unless `--keep-bmp` was remembered.)
 
 ```powershell
 python ..\..\calibration\check_trigger.py --port COM3   # proves frames AND brightness
@@ -180,8 +181,11 @@ python capture_3blackfly_sensor_force.py `
 * Set exposure with `tune_exposure.py --auto`, not with `--exposure-us`: the
   cameras need different gains when the rig is lit unevenly, and the capture
   script would force one value on all four.
-* Always run `check_trigger.py` first. A camera that cannot service the trigger
-  records **zero images** while the capture reports success.
+* `check_trigger.py` is worth running first, but read its result carefully: a
+  camera that cannot service the trigger records **zero images** while the
+  capture reports success — and `check_trigger.py` also reports zero on a rig
+  that is working. See the note at the end of this file before you go looking
+  for a broken wire.
 
 ### Camera-state tools
 
@@ -385,7 +389,15 @@ themselves:
   rate cap left at 5 fps, or `TriggerOverlap=Off` with an exposure that does not
   fit the trigger period, makes every pulse land while the sensor is busy. The
   capture script runs to completion and writes a session with zero images.
-  `check_trigger.py` catches it in ten seconds.
+  `check_trigger.py` is meant to catch it in ten seconds — **but it also returns
+  zero when nothing is wrong.** On 2026-09-30 it reported 0 complete and 0
+  incomplete frames on all four cameras, twice in a row, while the very next run
+  of `capture_3blackfly_sensor_force.py` recorded 179/179 frames on all four with
+  clean pairing. The capture script starts acquisition on every camera *before*
+  the Arduino handshake; `check_trigger` starts it afterwards, inside
+  `count_images`, by which time the pulses can already have stopped. **Treat a
+  zero from `check_trigger.py` as a reason to try the real capture, not as proof
+  of a hardware fault.**
 * **Exposure is not recorded when the capture script does not set it.** A session
   shot six times too dark looks identical in the logs. `detect_corners.py` now
   reports p99 per camera and refuses to stay quiet about it.

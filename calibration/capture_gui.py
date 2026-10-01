@@ -341,6 +341,12 @@ class Rig:
             np.ascontiguousarray(self.object_points[ids][:, :2], np.float64),
             np.ascontiguousarray(corners, np.float64), 0)
         facing = 0.0
+        # findHomography returns None on a degenerate point set -- corners that
+        # came back collinear, which a board held almost edge-on really does
+        # produce. The framing is then unknowable rather than zero, but the
+        # detection is still worth reporting, so fall back to what the
+        # no-detection path above returns instead of leaving these unbound.
+        in_frame, nudge = 0, ""
         if homography is not None:
             singular = np.linalg.svd(homography[:2, :2], compute_uv=False)
             if singular[0] > 1e-9:

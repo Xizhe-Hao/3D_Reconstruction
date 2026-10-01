@@ -119,16 +119,22 @@ Open the project folder in a terminal and activate its environment:
 Start acquisition:
 
 ```powershell
-python run_multimodal_workflow.py --port COM7
+python capture_3blackfly_sensor_force.py --port COM3 --cameras 4 --output D:\tactile_data\run01
 ```
 
-This command internally uses `capture_3blackfly_sensor_force.py`,
-`repair_sensor_session.py`, and `export_multimodal_mp4.py`. Keep these files
-beside `run_multimodal_workflow.py`; only the workflow entry point is run
-manually.
+Replace `COM3` with the Arduino port shown in Device Manager, and give
+`--output` a path on a disk that can sustain the write load — four cameras at
+24 fps is **~288 MiB/s**, and a disk that cannot keep up drops frames silently
+until the stream buffers overflow. The script refuses to start below
+`--minimum-free-gb` (20 by default).
 
-Replace `COM7` with the Arduino port shown in Device Manager. By default,
-captures are stored in the project's `captures` folder.
+Do **not** pass `--exposure-us` or `--gain-db`: they overwrite the values
+`tune_exposure.py --auto` stored in the cameras.
+
+There used to be a `run_multimodal_workflow.py` wrapper around this. It was
+removed: it did not forward the exposure arguments, and it deleted the source
+BMPs unless `--keep-bmp` was remembered. Call the capture script directly, then
+export and align in the two explicit steps below.
 
 Camera serial numbers are detected and sorted automatically. To force a
 specific camera order, add `--camera-serials CAM0 CAM1 CAM2 CAM3` — supply

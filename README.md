@@ -1,158 +1,205 @@
 # 3D_Reconstruction
 
-**Camera-free 3D shape + force reconstruction for soft deformable objects — unified workspace.**
+**The real-world capture rig for camera-free 3D shape + force reconstruction of
+soft deformable objects.**
 
-This repository consolidates the two prior codebases of our group into one place, as the starting point for the next stage of the project: extending camera-free soft-body deformation reconstruction with **force sensing**.
+A flexible 16×16 piezoresistive array is attached to a soft object. Four
+externally-triggered cameras and a Mark-10 force gauge record what is happening
+to it. After training, the goal is to reconstruct the object's 3D deformation
+and the contact force **from the tactile signal alone** — the cameras and the
+gauge are training-time ground truth, and are not present at inference.
 
-> **Nothing in the two source folders has been modified.** All source code is copied verbatim from the original repositories; only this top-level README (and `.gitignore`) are new.
-
-| Folder | Origin | Role in the project |
-|---|---|---|
-| [`sensor-data-collection/`](./sensor-data-collection) | [dfk0411/sensor-data-collection](https://github.com/dfk0411/sensor-data-collection) | **Real-world rig**: hardware firmware + synchronized multimodal data acquisition (tactile array + 4 cameras + force gauge) |
-| [`DeformFieldBench/`](./DeformFieldBench) | [3365538768/DeformFieldBench](https://github.com/3365538768/DeformFieldBench) | **Simulation benchmark + models**: material-parameter estimation from deformation videos (training, evaluation, simulation) |
-
----
-
-## 1. The Big Picture
-
-The overall research line of the group:
-
-```
-                         REAL WORLD                                    SIMULATION
-        ┌────────────────────────────────────────────┐   ┌─────────────────────────────────────┐
-        │  sensor-data-collection  (this = data rig)  │   │  DeformFieldBench (benchmark+models) │
-        │                                             │   │                                      │
-        │  16x16 tactile array ──► INPUT signal       │   │  Taichi/Warp MPM simulation          │
-        │  4x FLIR cameras     ──► SHAPE ground truth │   │  ──► 3-view RGB deformation videos   │
-        │  Mark-10 gauge       ──► FORCE ground truth │   │  ──► stress / flow / force fields    │
-        │                                             │   │  ──► GT material params (E, nu,      │
-        │  (synchronized, aligned capture sessions)   │   │       rho, sigma_y)                  │
-        └────────────────────┬────────────────────────┘   └──────────────────┬───────────────────┘
-                             │                                                │
-                             ▼                                                ▼
-              Train: tactile signal ──► shape (+ force)          Train: video ──► material params
-              Deploy: CAMERA-FREE reconstruction                 (vision + simulation, no touch)
-```
-
-Two complementary lines:
-
-1. **Shape line (real world, tactile).** A flexible piezoresistive tactile array is attached to a soft object. Four externally-triggered cameras and a Mark-10 force gauge act as *training-time ground truth only*. The goal: after training, reconstruct the object's 3D deformation (and now: contact force) **from the tactile signal alone — no cameras at inference time** ("camera-free"). The published predecessor of this line is the zero-shot deformation reconstruction paper (flexible sensor array + cage-based 3D Gaussian modeling, arXiv:2603.19543).
-2. **Physics line (simulation, vision).** DeformFieldBench asks a deeper question: not "what shape is it?" but "**what is it made of?**" — inferring material parameters (Young's modulus `E`, Poisson's ratio `nu`, density `rho`, yield stress `sigma_y`) from three-view RGB deformation videos, using MPM simulation for data generation and ground truth.
-
-**Where this repository is heading:** force is the physical bridge between the two lines (material properties = the relationship between force and deformation). By adding calibrated force to the real-world rig, the shape line can grow from geometry reconstruction toward real-world, touch-based physical understanding.
+That is the whole reason this repository is fussy about calibration: **the
+cameras *are* the shape ground truth**, so calibration error becomes label error
+that nothing downstream can detect.
 
 ---
 
-## 2. `sensor-data-collection/` — Real-World Acquisition Rig
+## Layout
 
-Records **synchronized** data from three sources:
-
-| Stream | Hardware | Role |
-|---|---|---|
-| Tactile frames (16×16, 8-bit) | Velostat piezoresistive array, scanned by **Arduino Nano + dual CD74HC4067 multiplexers** | **Model input** (the only stream that remains at deployment) |
-| Video (4 views) | 4× Teledyne FLIR **Blackfly S USB3** (PySpin / Spinnaker SDK) | **Shape ground truth** (training only) |
-| Force curve | **Mark-10** force gauge + IntelliMESUR tablet (CSV via email) | **Force ground truth** (training only) |
-
-### 2.1 Hardware (`Arduino files/`)
-
-- **`MatrixArrayDual4067Binary.ino`** — the one firmware to flash (Arduino Nano, ATmega328P).
-  - Scans the 16×16 array through two CD74HC4067 muxes: row address pins **D4–D7** (inhibit **D8**), column address pins **A1–A4** (inhibit **A5**).
-  - Streams binary frames over serial at **500000 baud**: magic `M16B`, version, dimensions, 8-bit ADC payload (256 bytes, row-major), frame index, device timestamp, 16-bit checksum.
-  - **Camera sync**: emits a 100 µs rising-edge pulse on **D9** — wired in parallel to the hardware-trigger input of *every* camera (currently four). This pulse is what makes the videos and the tactile stream line up. Cameras must be configured for external hardware trigger. Adding a camera is a wiring change only; the firmware is unchanged.
-
-### 2.2 Acquisition software (`Python files/`)
-
-| Script | What it does |
+| Folder | What it is |
 |---|---|
-| `run_multimodal_workflow.py` | **Main entry point.** Orchestrates the full Stage-A capture (`--port COMx`, optional `--camera-serials`, `--output`) |
-| `capture_3blackfly_sensor_force.py` | Simultaneous camera + tactile capture (called by the workflow) |
-| `repair_sensor_session.py` | Detects/repairs corrupted tactile frames in a session |
-| `export_multimodal_mp4.py` | Converts captured frames to synchronized color MP4s, verifies, cleans up BMPs |
-| `align_force_curve_only.py` | **Stage B.** Aligns the emailed Mark-10 CSV to the session using *curve-shape matching* between the force curve and the tactile signal (timestamps are ignored). Prints `score` / `confidence` / `peak_margin` |
-| `replay_capture_2d.py` | **Verification view.** Replays a session with a 2D top-down tactile image beside the camera previews and force curve; marks the contact patch and flags baseline drift |
-| `replay_capture_multimodal.py` | Same replay with a 3D bar panel. Better for judging relative depth or demoing; its z-axis is voltage, not displacement |
-| `requirements.txt` | Python deps (PySpin installed separately from the Teledyne wheel) |
+| [`sensor-data-collection/`](./sensor-data-collection) | The rig: Arduino firmware, synchronized capture, video export, force alignment, replay and bench tools |
+| [`calibration/`](./calibration) | Multi-camera calibration — intrinsics and extrinsics in the tactile array's own frame, in millimetres |
+| [`calibration/calibration.json`](./calibration/calibration.json) | **The calibration currently in use.** Keyed by camera serial |
 
-### 2.3 Quick start (Windows, tested config)
+Each folder has its own README with the full detail. This one is the map and the
+current state.
 
-1. Python 3.10 (64-bit), Spinnaker SDK 4.3.0.190 + matching Teledyne PySpin wheel, NumPy 1.26.4.
-2. Flash `Arduino files/MatrixArrayDual4067Binary.ino` (board: Arduino Nano; if upload fails, try the *Old Bootloader* processor option). Note the COM port.
-3. Verify D9 reaches all four camera trigger inputs; confirm each camera streams in SpinView, then **close SpinView**. (Different camera count? Add `--cameras N` in step 5.)
-4. ```powershell
-   py -3.10 -m venv .venv
-   .\.venv\Scripts\Activate.ps1
-   python -m pip install -r "sensor-data-collection\Python files\requirements.txt"
-   python -m pip install "path\to\teledyne\pyspin\wheel"
-   ```
-5. **Stage A** — capture: `python run_multimodal_workflow.py --port COM7` → baseline ≈1 s → run IntelliMESUR + perform the press/bend action → baseline ≈1 s → `Ctrl+C` → wait for MP4 verification.
-6. **Stage B** — force import: `python align_force_curve_only.py <session folder> <force csv>` (prefer `confidence=high`).
-7. Verify: `python replay_capture_2d.py <session folder>` (2D tactile image; use `replay_capture_multimodal.py` for the 3D bar view).
-
-Full details: [`sensor-data-collection/README.md`](./sensor-data-collection/README.md) (original, unmodified).
+**Captured data does not live in this repository.** Sessions go to a path you
+pass with `--output` (the rig writes ~288 MiB/s, and a single run is tens of
+gigabytes before video export). `.gitignore` keeps images, video and `.npz` out
+of version control; `calibration.json` and `board.json` are small and are
+committed on purpose.
 
 ---
 
-## 3. `DeformFieldBench/` — Simulation Benchmark & Models
+## The pipeline, end to end
 
-A benchmark for **material parameter estimation from deformable-object videos**: 5000 simulated samples; each `sample_pack.npz` holds three-view RGB deformation videos, force masks, projected flow fields, stress fields, object masks, and GT parameters (`E`, `nu`, `rho`, `sigma_y`).
+Two Python environments, because they cannot share one. Everything that touches
+a camera needs PySpin, which pins `numpy==1.26`; `cv::calibrateMultiview` exists
+only in OpenCV 5, which needs `numpy>=2`.
 
-- **Dataset**: [Physical Field Material Parameter 5000 (Kaggle)](https://www.kaggle.com/datasets/anonymous336/physical-field-material-parameter-5000) — *not stored in this repo*; download or regenerate via simulation.
-- **Checkpoints**: [HandsomeHusky/DeformFieldBench (Hugging Face)](https://huggingface.co/HandsomeHusky/DeformFieldBench/tree/main) — `bash pretrained/download_models.sh`.
-- All "videos" here are **simulation renders** (Taichi/Warp MPM), not real footage.
+| Environment | Where | Used by |
+|---|---|---|
+| **capture** | `sensor-data-collection/Python files/.venv` | everything that talks to a camera or the Arduino |
+| **calibration** | `.venv-calib` (repo root) | the offline solve: `detect_corners`, `calibrate`, `validate`, `inspect_calib` |
 
-### 3.1 Map of the codebase
+### 1. Calibrate (once per rig configuration)
 
-| Folder | What it contains |
-|---|---|
-| `simulation/` | MPM physics simulation (Taichi + Warp): `mpm_solver_warp/`, `particle_filling/`, a vendored `gaussian-splatting/` renderer, per-action configs (`press/drop/shear/stretch/bend_cube_jelly.json`, …) |
-| `configs/` | Run configs: `simulation/` (dataset generation), `my_model/`, `logic_model/` (training) |
-| `my_model/` | **Arch4** — supervised parameter-regression baseline (`my_model.train`) |
-| `logic_model/` | **Logic Model** — the final model (`logic_v2_dino`: frozen DINOv2 encoder, temporal transformer adapter, multi-view fusion, dense field heads + physics bottleneck) |
-| `eval/`, `eval_abalation/` | Unified evaluation: parameter metrics (MAE/RMSE/MAPE/R²), field metrics (MSE/SSIM/IoU), ablation configs, **parameter-ambiguity replay** (re-simulate with predicted params, compare via SSIM/PSNR) |
-| `vlm_benchmark/` | Benchmarks vision-language models (OpenAI/DashScope/ARK clients) on the same task |
-| `my_utils/`, `utils/` | Sample packing, LMDB caching, camera/rendering utilities |
-| `pretrained/` | Checkpoint download script + registry (`models.yaml`) |
-| `scripts/` | Entry-point shell scripts (`run_simulation_sample_pack.sh`, `train_logic.sh`, `train_my_model_param_only.sh`, `eval_*.sh`, `setup_env.sh`) |
+```powershell
+cd "sensor-data-collection\Python files"
+.\.venv\Scripts\Activate.ps1
 
-### 3.2 Typical commands
-
-```bash
-# Environment (Python 3.10; torch 2.8; taichi 1.5.0; warp_lang 0.10.1)
-pip install -r DeformFieldBench/requirements.txt
-source DeformFieldBench/scripts/setup_env.sh
-
-# Generate one simulated sample (press/drop/shear/stretch/bend)
-PLY_PATH=/path/to/object.ply SIM_TYPE=press \
-CONFIG=configs/simulation/train_config_dataset_full.json \
-OUTPUT_PATH=outputs/simulation_sample \
-bash scripts/run_simulation_sample_pack.sh
-
-# Train the supervised baseline (Arch4, parameters only)
-NUM_GPUS=8 bash scripts/train_my_model_param_only.sh
-
-# Train the final Logic Model
-NUM_GPUS=8 bash scripts/train_logic.sh
+python ..\..\calibration\check_stability.py --minutes 20     # does the rig hold still?
+python ..\..\calibration\tune_exposure.py --auto --gain-db 0 --max-exposure-us 40000
+python ..\..\calibration\capture_gui.py `
+    --board ..\..\calibration\board\board.json `
+    --output C:\tactile_calib\guidedN --in-frame-frac 1.0
 ```
 
-Full details: [`DeformFieldBench/README.md`](./DeformFieldBench/README.md) (original, unmodified).
+`capture_gui.py` walks the protocol, records only poses that qualify, and then
+solves and grades itself — GOOD / MARGINAL / NOT USABLE. Copy the resulting
+`calibration.json` over [`calibration/calibration.json`](./calibration/calibration.json)
+and commit it.
+
+`--in-frame-frac 1.0` matters: the default (0.85) lets through frames where a
+camera sees 119 of the 140 corners, but the strict multi-view solve only uses
+frames where it saw **all** of them. At 0.85 a session can finish looking healthy
+and leave the solver with nothing.
+
+See [`calibration/README.md`](./calibration/README.md) for the protocol, the
+acceptance criteria, and a long list of failures that each cost a session.
+
+### 2. Capture
+
+```powershell
+python ..\..\calibration\tune_exposure.py --auto    # under the measurement lighting
+python ..\..\calibration\tune_exposure.py --prepare # does the exposure fit the trigger period?
+
+python capture_3blackfly_sensor_force.py --port COM3 --cameras 4 --output D:\tactile_data\run01
+```
+
+**Start the capture first, then run the force test**, so the whole force curve
+falls inside the recording. Force samples with no images are not usable as
+ground truth.
+
+Do not pass `--exposure-us` or `--gain-db` — they overwrite what
+`tune_exposure.py` stored in the cameras. Lighting may change freely between
+calibration and capture; **the lenses may not.** Focus and aperture are part of
+the calibration, so adjust brightness with exposure time and gain only.
+
+### 3. Export video
+
+```powershell
+python export_multimodal_mp4.py D:\tactile_data\run01\capture_YYYYmmdd_HHMMSS --crf 12
+```
+
+Encodes the raw Bayer BMPs to one MP4 per camera and writes
+`multimodal_video_alignment.csv`, the per-frame join table. Add
+`--delete-images` to drop the BMPs — it only deletes after every MP4 has been
+decoded and verified against the expected frame count. CRF 12 rather than the
+default 18 because this is measurement data; note the output is `yuv420p`, so
+chroma is half resolution either way.
+
+### 4. Attach the force curve
+
+```powershell
+python align_force_curve_only.py D:\tactile_data\run01\capture_YYYYmmdd_HHMMSS "force.csv"
+```
+
+IntelliMESUR runs on a separate tablet, so no file timestamp is meaningful. This
+recovers the offset from the data by correlating the force curve against tactile
+features across the whole recording, and reports a confidence and a runner-up
+margin. **Check that confidence** — `ambiguous` means the result should not be
+trusted.
+
+> **The tactile signal is inversely related to load** (`V_sensor = Vdrive -
+> V_adc`), so the true correlation is *negative*. An earlier `align_force.py`
+> rejected negative correlations and therefore never considered the correct peak;
+> it has been removed. Anything new that aligns these two streams must use the
+> absolute correlation.
+
+### 5. Verify
+
+```powershell
+python replay_capture_2d.py <session>            # 2D top-down — the check view
+python replay_capture_multimodal.py <session>    # 3D bar view
+```
+
+2D is the default for checking a capture: no occlusion, and it registers
+directly against the camera previews. The 3D view's z-axis is **sensor voltage,
+not displacement** — it is a visualisation, not a physical shape.
 
 ---
 
-## 4. How the Pieces Fit Together (and What Comes Next)
+## Current state
 
-**Roles of each stream, stated once and precisely:**
+**Calibration** — [`calibration/calibration.json`](./calibration/calibration.json),
+solved 2026-09-30 from `guided8`, rig stable throughout (0.00 px drift on all
+four cameras).
 
-- The **tactile array is the input** — the only sensor that remains at deployment. "Camera-free" means *no cameras at inference*; cameras supervise training only.
-- The **cameras are the shape answer key** (multi-view triangulation; consumer RGB-D was rejected because its depth precision cannot resolve millimeter-level soft-body deformation on a textureless surface). The rig grew from three views to four to improve triangulation coverage.
-- The **Mark-10 is the force answer key** — the new stream this project adds on top of the published shape-only work.
+```
+inter-corner distance error P95   0.173 mm   (target ≤ 0.30)   PASS
+board rigid-fit residual RMS      0.100 mm   (target ≤ 0.20)   PASS
+worst per-camera intrinsics RMS   0.924 px   (target ≤ 0.30)   FAIL
+worst pair epipolar RMS           1.325 px   (target ≤ 1.00)   over
+```
 
-**Next-stage direction (why this consolidation exists):**
+Usable, with **0.17 mm as the error floor** on any reconstructed shape. The
+metric rows are the acceptance criterion — focal length and range are coupled, so
+a millimetre error on held-out frames is the honest measure. The pixel rows are
+over target because the extrinsics came from a sub-pattern solve (80 shared
+corners, not the full 140) and the board was never held square-on enough to pin
+down the intrinsics. Re-calibrating with `--in-frame-frac 1.0` and better facing
+is the fix; post-processing is not.
 
-1. Reproduce the multi-camera + tactile capture (Section 2, now 4 views) and the shape-reconstruction result of the predecessor paper.
-2. Add force: train *tactile → shape + contact force*, keeping the camera-free / zero-shot properties.
-3. Bridge to the physics line: with measured force + reconstructed deformation, move toward real-world material/physical understanding — the question DeformFieldBench answers in simulation — and toward robot applications (force-aware soft grippers, contact-rich data collection for embodied AI).
+**Known problems, in the order they will bite:**
 
-## 5. Repository Hygiene
+- **The tactile array is degrading, and quickly.** Between two sessions sixteen
+  hours apart on 2026-09-30 the signal span fell from 0.87 V to 0.06 V, cells
+  that interpolation could not repair went from 26 to 16996, and row 13 went from
+  failing in 9% of frames to **100%**. Rows 3, 4, 14, 16 and column 1 are now
+  failing too. The pattern is whole rows and columns, which is a
+  multiplexer/wiring signature rather than wear. **Check this with
+  `test/live_sensor_2d.py` before trusting a capture** — a session recorded
+  through a dead array looks completely normal in the logs.
+- **The force gauge is out of calibration** (due 2026-07-22). Fine for
+  correlation and relative work; treat the newton values with caution as absolute
+  ground truth.
+- **Write bandwidth is a real constraint.** Four cameras at 24 fps is ~288 MiB/s.
+  A disk that cannot sustain it drops frames per camera, independently, and the
+  session's `sequential_pairing_clean` goes false. Video export recovers a usable
+  set by keeping only the frames every camera and the sensor share, but the
+  frames are then not contiguous in the capture timeline.
+- **`check_trigger.py` returns zero on a working rig.** It is still worth
+  running, but a zero is a reason to try the real capture, not proof of a broken
+  trigger. See the end of [`calibration/README.md`](./calibration/README.md).
 
-- Large data (capture sessions, `auto_output/` datasets, checkpoints) must **not** be committed — see `.gitignore`. Use the Kaggle/HF links or lab storage.
-- The two source folders are snapshots; upstream repos remain the canonical history. Keep any new code (force pipeline, new models) in **new top-level folders** so the provenance stays clean.
+---
+
+## Bench tools
+
+| Tool | Use |
+|---|---|
+| `test/live_sensor_2d.py` | live 2D pressure image — **the fastest way to see whether the array is alive** |
+| `test/live_sensor_3d.py` | live 3D bars; judge the deformation shape before committing to a capture |
+| `calibration/inspect_calib.py` | re-projection, epipolar lines, and the rig in 3D — where a calibration fails, not just whether |
+| `calibration/check_stability.py` | 20 minutes, no board, no solve: does the rig hold still? |
+| `calibration/focus_check.py` | edge sharpness per camera; separates a misfocused lens from a board outside the depth of field |
+| `calibration/pose_helper.py` | live "facing" score while rehearsing how to hold the board |
+| `calibration/tests/run_selftest.py` | synthetic rig end to end; run after changing anything in `calibration/` |
+
+---
+
+## History
+
+This repository previously also vendored `DeformFieldBench/`, the simulation and
+material-parameter line of the project (MPM simulation, three-view video →
+material parameters). It was removed on 2026-09-30 to keep this repository to the
+physical rig; it remains in the git history and in its own upstream repository.
+
+`run_multimodal_workflow.py` and `repair_sensor_session.py` were removed at the
+same time — the workflow wrapper did not forward exposure arguments and deleted
+source images by default, and the repair script was only reachable through it.
+Call the capture, export and alignment steps directly, as above.
