@@ -8,7 +8,7 @@ This repository holds the whole real-world pipeline of the project in one place:
 |---|---|---|
 | [`sensor-data-collection/`](./sensor-data-collection) | [dfk0411/sensor-data-collection](https://github.com/dfk0411/sensor-data-collection) | **1. Capture**: firmware + synchronized acquisition (16×16 tactile array + 4 cameras + Mark-10 force gauge) |
 | [`calibration/`](./calibration) | this repo | **2. Calibrate**: intrinsics + extrinsics of the 4 cameras, in millimetres, in the tactile-array frame → `calibration.json` |
-| [`reconstruction/`](./reconstruction) | [3365538768/ND_mvtracker_reconstruction](https://github.com/3365538768/ND_mvtracker_reconstruction) @ `4355999` | **3. Reconstruct**: metric multi-view depth (DUSt3R) + 4D point tracking (MVTracker) → per-frame 3D trajectories and dense point clouds |
+| [`reconstruction/`](./reconstruction) | [3365538768/ND_mvtracker_reconstruction](https://github.com/3365538768/ND_mvtracker_reconstruction) @ `17b5e19` | **3. Reconstruct**: calibrated metric multi-view depth (DUSt3R, FoundationStereo or Depth Anything 3) + 4D point tracking (MVTracker) → per-frame 3D trajectories and dense point clouds |
 
 The simulation benchmark that used to live here (`DeformFieldBench/`) has been removed because the project no longer uses simulation. It is still in git history (commit `9926942`) and upstream at [3365538768/DeformFieldBench](https://github.com/3365538768/DeformFieldBench).
 
@@ -19,9 +19,9 @@ The simulation benchmark that used to live here (`DeformFieldBench/`) has been r
 ```
   sensor-data-collection            calibration                    reconstruction
  ┌─────────────────────────┐   ┌─────────────────────────┐   ┌──────────────────────────────┐
- │ 16x16 tactile ─► input  │   │ ChArUco sessions        │   │ DUSt3R: metric depth per     │
- │ 4x FLIR (D9 trigger)    │   │  ─► calibration.json    │   │   timestamp, poses fixed to  │
- │ Mark-10 ─► force GT     │   │  (K, dist, R|t, mm,     │   │   calibration.json           │
+ │ 16x16 tactile ─► input  │   │ ChArUco sessions        │   │ depth backend (DUSt3R /      │
+ │ 4x FLIR (D9 trigger)    │   │  ─► calibration.json    │   │   FoundationStereo / DA3):   │
+ │ Mark-10 ─► force GT     │   │  (K, dist, R|t, mm,     │   │   metric depth from calib    │
  │                         │   │   tactile-array frame)  │   │ MVTracker: 3D point tracks   │
  │ session/                │   └────────────┬────────────┘   │   over time                  │
  │  camera_i_<serial>*.mp4 │                │                │ ─► tracks_4d.npz/.csv/.rrd   │
@@ -134,11 +134,25 @@ Full details: [`calibration/README.md`](./calibration/README.md), which also lis
 
 ## 4. `reconstruction/`: Reconstruct
 
-For each sampled timestamp, DUSt3R matches all pairs among the four synchronized views and globally aligns one metric scene with the calibrated intrinsics and poses held fixed. MVTracker then tracks 3D query points through time over those depths. Outputs, in metres, in the calibration world frame:
+The pipeline has two stages, and the first one is swappable. For each sampled timestamp a **depth backend** turns the four synchronized, undistorted views into one metric depth map per camera, using the calibrated intrinsics and poses. **MVTracker** then tracks 3D query points through time over those depths. Every timestamp is processed independently: the object deforms, so nothing assumes a static scene.
+
+| `--depth-backend` | Method | Environment | Status |
+|---|---|---|---|
+| `duster` (default) | DUSt3R: all view pairs, global alignment with K and poses **held fixed** | `mvtracker` conda env | Original pipeline; full 96-frame runs done |
+| `foundationstereo` | FoundationStereo stereo matching on rectified neighbouring pairs (`0-2,1-3`), full 2048×1536, hierarchical inference | separate `foundation_stereo` conda env | New; 7-frame smoke tests only. **Non-commercial research licence** |
+| `da3` | Depth Anything 3 **giant**: four views jointly with K + metric w2c poses, scale aligned to the input extrinsics (`align_to_input_ext_scale=True`) | project-local `.venv-da3` (uv, `requirements_da3.lock`) | New; 7-frame pipeline validated 2026-10-01, accuracy **not** validated |
+| `moge2` | MoGe-2 monocular depth | `mvtracker` conda env | Fast baseline only |
+| `npz` | Externally computed metric depth (`--depth-path`, `--depth-unit m` or `mm`) | — | For plugging in other methods |
+
+FoundationStereo and DA3 run in a subprocess, so their GPU memory is released before MVTracker starts. Depth is cached per frame (`<backend>/frame_NNNNN.npz`) and keyed on the inputs and the config: an interrupted run resumes, and `--recompute-depth` forces a recompute.
+
+Outputs, in metres, in the calibration world frame, under `outputs/<name>/seconds_<start>_<end>_target_<N>_<backend>/`:
 
 - `tracks_4d.npz` / `tracks_4d.csv`: sparse point trajectories `(track_id, frame, time, x, y, z, visible)`, keyed by the source frame index and `video_time_s`, so they join back to the tactile/force rows in `multimodal_video_alignment.csv`
 - `tracks_4d.rrd`: Rerun playback (cameras, fused point cloud, tracks)
 - `ply/`, `ply_dense/`: tracked points and fused dense RGB-D point cloud per timestamp
+- `depths_<backend>_m.npz` and `<backend>/`: the depth MVTracker used, plus per-backend extras (FoundationStereo disparity and valid masks, DA3 confidence and `manifest.json`)
+- `run.json`: the full configuration of the run
 
 MVTracker gives point trajectories, not a watertight deforming mesh.
 
@@ -158,26 +172,53 @@ The adapter checks that there are **exactly 4 cameras**, that each calibrated se
 
 ### 4.2 Running it (Linux + CUDA GPU)
 
-The reconstruction environment needs Linux, Conda and a CUDA 12.1-compatible driver (the setup scripts use `conda`, `wget`, `md5sum`), so it runs on the lab GPU server rather than the Windows capture PC. Run everything from `reconstruction/`:
+The reconstruction environments need Linux, Conda and a CUDA 12.1-compatible driver (the setup scripts use `conda`, `wget`, `md5sum`), so they run on the lab GPU server rather than the Windows capture PC. Run everything from `reconstruction/`:
 
 ```bash
-git submodule update --init --recursive      # MVTracker + DUSt3R at pinned commits
+git submodule update --init --recursive      # MVTracker, DUSt3R, FoundationStereo, DA3 at pinned commits
 cd reconstruction
-bash scripts/setup_mvtracker.sh              # conda env "mvtracker" + MVTracker checkpoint
+bash scripts/setup_mvtracker.sh              # conda env "mvtracker" + MVTracker checkpoint (always needed)
 bash scripts/setup_duster.sh                 # DUSt3R + 2.1 GB checkpoint (MD5-checked)
-
-# put the session (with calibration.json) at reconstruction/data/<name>/, then:
-SESSION_DIR=data/<name> OUTPUT_DIR=outputs/<name> END_FRAME=<frame_count-1> \
-  bash scripts/run_duster_tracking_full.sh
-
-# browse the result
-conda run --no-capture-output -n mvtracker python scripts/mvtracker_visualizer_gradio.py \
-  --result-dir outputs/<name>/frames_0_<end>_target_96_duster
+bash scripts/setup_foundationstereo.sh       # optional: env "foundation_stereo" + ViT-L 23-51-11 checkpoint
+bash scripts/setup_da3.sh                    # optional: .venv-da3 + DA3-GIANT weights in outputs/models/
 ```
 
-Start with a short smoke test (`--start 660 --end 666 --target-frames 7 --duster-ga-niter 50`) before a full 96-frame run; each timestamp is a full multi-view DUSt3R alignment. `reconstruction/data/` and `outputs/` are git-ignored.
+Put the session (with `calibration.json`) at `reconstruction/data/<name>/`. `--start` and `--end` are in **video seconds** (omit `--end` for the end of the video). Smoke-test a short clip first:
 
-Full details (Chinese): [`reconstruction/README.md`](./reconstruction/README.md), [`reconstruction/docs/`](./reconstruction/docs).
+```bash
+conda run --no-capture-output -n mvtracker python scripts/run_test_session.py \
+  --session-dir data/<name> --start 0 --end 0.5 \
+  --target-frames 7 --max-frames 7 \
+  --depth-backend duster --duster-ga-niter 50 \
+  --device cuda --output-dir outputs/<name>
+```
+
+Swap in `--depth-backend foundationstereo` or `--depth-backend da3` to try the other backends; their full flag sets are in [`reconstruction/README.md`](./reconstruction/README.md). The full 96-timestamp DUSt3R run has a wrapper configured through environment variables:
+
+```bash
+SESSION_DIR=data/<name> OUTPUT_DIR=outputs/<name> START_SECONDS=0 END_SECONDS=<t> \
+  bash scripts/run_duster_tracking_full.sh
+```
+
+Browse the results (forward the port over SSH or from the IDE):
+
+```bash
+# tracks + point clouds (Rerun inside Gradio), port 7861
+conda run --no-capture-output -n mvtracker python scripts/mvtracker_visualizer_gradio.py \
+  --result-dir outputs/<name>/seconds_<start>_<end>_target_<N>_duster
+
+# four-view depth with synchronised playback, for DUSt3R or DA3 results
+conda run --no-capture-output -n mvtracker python scripts/duster_depth_viewer_gradio.py \
+  --result-dir outputs/<name>/seconds_<start>_<end>_target_<N>_da3 --server-port 7862
+
+# FoundationStereo: rectified RGB, filtered/raw depth, valid mask, disparity
+conda run --no-capture-output -n mvtracker python scripts/foundationstereo_depth_viewer_gradio.py \
+  --result-dir outputs/<name>/seconds_<start>_<end>_target_<N>_foundationstereo --server-port 7861
+```
+
+`reconstruction/data/`, `outputs/`, checkpoints and `.venv-da3/` are git-ignored. A 96-frame FoundationStereo depth cache takes from several GB to over 10 GB.
+
+Full details (Chinese): [`reconstruction/README.md`](./reconstruction/README.md) and [`reconstruction/docs/`](./reconstruction/docs), including [`DA3_VALIDATION_ZH.md`](./reconstruction/docs/DA3_VALIDATION_ZH.md), the DA3 install and smoke-test record.
 
 ---
 
@@ -194,6 +235,14 @@ worst pair epipolar RMS           1.325 px   (target ≤ 1.00)   over
 
 Usable, with **0.17 mm as the error floor** on any reconstructed shape. The metric rows are the acceptance criterion — focal length and range are coupled, so a millimetre error on held-out frames is the honest measure and a pixel residual is not. The pixel rows are over target for real reasons: the extrinsics came from a sub-pattern solve (80 shared corners, not the full 140) because two cameras rarely saw the whole board, and the intrinsics are under-determined because the board was never held square-on enough. Re-calibrating with `--in-frame-frac 1.0` and better facing is the fix; post-processing is not.
 
+**Reconstruction** — three calibrated depth backends run end to end, but **none has been checked against a known shape yet**, so which one supplies the shape ground truth is still open.
+
+- DUSt3R is the established path (full 96-frame runs).
+- DA3 giant (2026-10-01, `data/test_1001`, 0–0.5 s, 7 frames): 41 s for the whole pipeline, 7.9 GiB peak GPU, 91 % valid depth, 96 % track visibility. The main shape is visible, but planes and edges are smoothed and fine surface texture is not recovered. Median cross-view reprojection differences are 3–6 mm in three directions and **22 mm for camera 1 → 3**; they include occlusion and are not an error measurement.
+- FoundationStereo has only been smoke-tested.
+
+Next: compare the backends on a clearly loaded deformation clip against something known (a flat surface, a known displacement), with the 0.17 mm calibration floor above as the reference.
+
 **Known problems, in the order they will bite:**
 
 - **The tactile array is degrading, and quickly.** Between two sessions sixteen hours apart on 2026-09-30 the signal span fell from 0.87 V to 0.06 V, cells that interpolation could not repair went from 26 to 16996, and row 13 went from failing in 9 % of frames to **100 %**. Rows 3, 4, 14, 16 and column 1 are now failing too. Whole rows and columns is a multiplexer/wiring signature, not wear. **Check with `test/live_sensor_2d.py` before trusting a capture** — a session recorded through a dead array looks completely normal in the logs.
@@ -203,12 +252,12 @@ Usable, with **0.17 mm as the error floor** on any reconstructed shape. The metr
 
 ## 6. What Comes Next
 
-1. Reproduce the four-camera + tactile capture and the shape-reconstruction result of the predecessor paper, now with the calibrated DUSt3R + MVTracker reconstruction as shape ground truth.
+1. Reproduce the four-camera + tactile capture and the shape-reconstruction result of the predecessor paper, now with the calibrated multi-view depth + MVTracker reconstruction as shape ground truth, once a depth backend is chosen (§5).
 2. Add force: train *tactile → shape + contact force*, keeping the camera-free / zero-shot properties.
 3. With measured force + reconstructed deformation, move toward real-world material/physical understanding and robot applications (force-aware soft grippers, contact-rich data collection for embodied AI).
 
 ## 7. Repository Hygiene
 
 - Large data (capture sessions, reconstruction outputs, checkpoints, `.ply`/`.rrd`/`.mp4`) must **not** be committed; see `.gitignore`. Use lab storage. `calibration.json` and `board.json` are small and *are* committed on purpose.
-- `sensor-data-collection/` and `reconstruction/` mirror upstream repos. `reconstruction/submodule/*` are third-party submodules pinned to specific commits: keep them clean, and put project code in `reconstruction/scripts/`.
+- `sensor-data-collection/` and `reconstruction/` mirror upstream repos; `reconstruction/` is a subtree merge of ND_mvtracker_reconstruction, so pull upstream changes the same way. `reconstruction/submodule/*` are third-party submodules pinned to specific commits: keep them clean, and put project code in `reconstruction/scripts/`.
 - Keep new code (force pipeline, tactile→shape models) in **new top-level folders**.
