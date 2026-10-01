@@ -8,7 +8,7 @@ This repository holds the whole real-world pipeline of the project in one place:
 |---|---|---|
 | [`sensor-data-collection/`](./sensor-data-collection) | [dfk0411/sensor-data-collection](https://github.com/dfk0411/sensor-data-collection) | **1. Capture**: firmware + synchronized acquisition (16×16 tactile array + 4 cameras + Mark-10 force gauge) |
 | [`calibration/`](./calibration) | this repo | **2. Calibrate**: intrinsics + extrinsics of the 4 cameras, in millimetres, in the tactile-array frame → `calibration.json` |
-| [`reconstruction/`](./reconstruction) | [3365538768/ND_mvtracker_reconstruction](https://github.com/3365538768/ND_mvtracker_reconstruction) @ `17b5e19` | **3. Reconstruct**: calibrated metric multi-view depth (DUSt3R, FoundationStereo or Depth Anything 3) + 4D point tracking (MVTracker) → per-frame 3D trajectories and dense point clouds |
+| [`reconstruction/`](./reconstruction) | [3365538768/ND_mvtracker_reconstruction](https://github.com/3365538768/ND_mvtracker_reconstruction) @ `17b5e19` | **3. Reconstruct**: calibrated metric multi-view depth (**Depth Anything 3 giant**; DUSt3R and FoundationStereo as alternatives) + 4D point tracking (MVTracker) → per-frame 3D trajectories and dense point clouds |
 
 The simulation benchmark that used to live here (`DeformFieldBench/`) has been removed because the project no longer uses simulation. It is still in git history (commit `9926942`) and upstream at [3365538768/DeformFieldBench](https://github.com/3365538768/DeformFieldBench).
 
@@ -19,8 +19,8 @@ The simulation benchmark that used to live here (`DeformFieldBench/`) has been r
 ```
   sensor-data-collection            calibration                    reconstruction
  ┌─────────────────────────┐   ┌─────────────────────────┐   ┌──────────────────────────────┐
- │ 16x16 tactile ─► input  │   │ ChArUco sessions        │   │ depth backend (DUSt3R /      │
- │ 4x FLIR (D9 trigger)    │   │  ─► calibration.json    │   │   FoundationStereo / DA3):   │
+ │ 16x16 tactile ─► input  │   │ ChArUco sessions        │   │ Depth Anything 3 giant:      │
+ │ 4x FLIR (D9 trigger)    │   │  ─► calibration.json    │   │   4 views per timestamp,     │
  │ Mark-10 ─► force GT     │   │  (K, dist, R|t, mm,     │   │   metric depth from calib    │
  │                         │   │   tactile-array frame)  │   │ MVTracker: 3D point tracks   │
  │ session/                │   └────────────┬────────────┘   │   over time                  │
@@ -134,13 +134,15 @@ Full details: [`calibration/README.md`](./calibration/README.md), which also lis
 
 ## 4. `reconstruction/`: Reconstruct
 
-The pipeline has two stages, and the first one is swappable. For each sampled timestamp a **depth backend** turns the four synchronized, undistorted views into one metric depth map per camera, using the calibrated intrinsics and poses. **MVTracker** then tracks 3D query points through time over those depths. Every timestamp is processed independently: the object deforms, so nothing assumes a static scene.
+The pipeline has two stages. For each sampled timestamp a **depth backend**, currently **Depth Anything 3 giant**, turns the four synchronized, undistorted views into one metric depth map per camera, using the calibrated intrinsics and poses. **MVTracker** then tracks 3D query points through time over those depths. Every timestamp is processed independently: the object deforms, so nothing assumes a static scene.
+
+**The code default is still `duster`.** `run_test_session.py` falls back to DUSt3R and `run_duster_tracking_full.sh` is DUSt3R-only, so pass `--depth-backend da3` explicitly.
 
 | `--depth-backend` | Method | Environment | Status |
 |---|---|---|---|
-| `duster` (default) | DUSt3R: all view pairs, global alignment with K and poses **held fixed** | `mvtracker` conda env | Original pipeline; full 96-frame runs done |
+| **`da3`** (in use) | Depth Anything 3 **giant**: four views jointly with K + metric w2c poses, scale aligned to the input extrinsics (`align_to_input_ext_scale=True`) | project-local `.venv-da3` (uv, `requirements_da3.lock`) | Current method. 7-frame pipeline validated 2026-10-01; depth accuracy **not** validated |
+| `duster` (code default) | DUSt3R: all view pairs, global alignment with K and poses **held fixed** | `mvtracker` conda env | Previous method; full 96-frame runs done |
 | `foundationstereo` | FoundationStereo stereo matching on rectified neighbouring pairs (`0-2,1-3`), full 2048×1536, hierarchical inference | separate `foundation_stereo` conda env | New; 7-frame smoke tests only. **Non-commercial research licence** |
-| `da3` | Depth Anything 3 **giant**: four views jointly with K + metric w2c poses, scale aligned to the input extrinsics (`align_to_input_ext_scale=True`) | project-local `.venv-da3` (uv, `requirements_da3.lock`) | New; 7-frame pipeline validated 2026-10-01, accuracy **not** validated |
 | `moge2` | MoGe-2 monocular depth | `mvtracker` conda env | Fast baseline only |
 | `npz` | Externally computed metric depth (`--depth-path`, `--depth-unit m` or `mm`) | — | For plugging in other methods |
 
@@ -178,22 +180,23 @@ The reconstruction environments need Linux, Conda and a CUDA 12.1-compatible dri
 git submodule update --init --recursive      # MVTracker, DUSt3R, FoundationStereo, DA3 at pinned commits
 cd reconstruction
 bash scripts/setup_mvtracker.sh              # conda env "mvtracker" + MVTracker checkpoint (always needed)
-bash scripts/setup_duster.sh                 # DUSt3R + 2.1 GB checkpoint (MD5-checked)
+bash scripts/setup_da3.sh                    # .venv-da3 + DA3-GIANT weights in outputs/models/DA3-GIANT
+bash scripts/setup_duster.sh                 # optional: DUSt3R + 2.1 GB checkpoint (MD5-checked)
 bash scripts/setup_foundationstereo.sh       # optional: env "foundation_stereo" + ViT-L 23-51-11 checkpoint
-bash scripts/setup_da3.sh                    # optional: .venv-da3 + DA3-GIANT weights in outputs/models/
 ```
 
-Put the session (with `calibration.json`) at `reconstruction/data/<name>/`. `--start` and `--end` are in **video seconds** (omit `--end` for the end of the video). Smoke-test a short clip first:
+Put the session (with `calibration.json`) at `reconstruction/data/<name>/`. `--start` and `--end` are in **video seconds** (omit `--end` for the end of the video). The DA3 run, as validated on `data/test_1001` (start with a short clip like this before a long one):
 
 ```bash
 conda run --no-capture-output -n mvtracker python scripts/run_test_session.py \
   --session-dir data/<name> --start 0 --end 0.5 \
-  --target-frames 7 --max-frames 7 \
-  --depth-backend duster --duster-ga-niter 50 \
-  --device cuda --output-dir outputs/<name>
+  --target-frames 7 --max-frames 7 --width 512 --height 384 \
+  --depth-backend da3 --da3-process-res 504 \
+  --da3-confidence-percentile 10 --min-depth-m 0.03 --max-depth-m 2 \
+  --query-grid-size 16 --device cuda --output-dir outputs/<name>
 ```
 
-Swap in `--depth-backend foundationstereo` or `--depth-backend da3` to try the other backends; their full flag sets are in [`reconstruction/README.md`](./reconstruction/README.md). The full 96-timestamp DUSt3R run has a wrapper configured through environment variables:
+DA3 runs in its own `.venv-da3` interpreter as a subprocess (`--da3-python`), so the command is still launched from the `mvtracker` env. `--da3-confidence-percentile 10` drops each view's least confident 10 % of pixels (0 disables it). For the alternatives use `--depth-backend duster` or `--depth-backend foundationstereo`; their full flag sets are in [`reconstruction/README.md`](./reconstruction/README.md). The DUSt3R-only wrapper for a full 96-timestamp run is configured through environment variables:
 
 ```bash
 SESSION_DIR=data/<name> OUTPUT_DIR=outputs/<name> START_SECONDS=0 END_SECONDS=<t> \
@@ -205,9 +208,9 @@ Browse the results (forward the port over SSH or from the IDE):
 ```bash
 # tracks + point clouds (Rerun inside Gradio), port 7861
 conda run --no-capture-output -n mvtracker python scripts/mvtracker_visualizer_gradio.py \
-  --result-dir outputs/<name>/seconds_<start>_<end>_target_<N>_duster
+  --result-dir outputs/<name>/seconds_<start>_<end>_target_<N>_da3
 
-# four-view depth with synchronised playback, for DUSt3R or DA3 results
+# four-view depth with synchronised playback, for DA3 or DUSt3R results
 conda run --no-capture-output -n mvtracker python scripts/duster_depth_viewer_gradio.py \
   --result-dir outputs/<name>/seconds_<start>_<end>_target_<N>_da3 --server-port 7862
 
@@ -235,13 +238,12 @@ worst pair epipolar RMS           1.325 px   (target ≤ 1.00)   over
 
 Usable, with **0.17 mm as the error floor** on any reconstructed shape. The metric rows are the acceptance criterion — focal length and range are coupled, so a millimetre error on held-out frames is the honest measure and a pixel residual is not. The pixel rows are over target for real reasons: the extrinsics came from a sub-pattern solve (80 shared corners, not the full 140) because two cameras rarely saw the whole board, and the intrinsics are under-determined because the board was never held square-on enough. Re-calibrating with `--in-frame-frac 1.0` and better facing is the fix; post-processing is not.
 
-**Reconstruction** — three calibrated depth backends run end to end, but **none has been checked against a known shape yet**, so which one supplies the shape ground truth is still open.
+**Reconstruction** — the current method is **Depth Anything 3 giant**. It runs end to end, but its depth has **not been checked against a known shape yet**.
 
-- DUSt3R is the established path (full 96-frame runs).
 - DA3 giant (2026-10-01, `data/test_1001`, 0–0.5 s, 7 frames): 41 s for the whole pipeline, 7.9 GiB peak GPU, 91 % valid depth, 96 % track visibility. The main shape is visible, but planes and edges are smoothed and fine surface texture is not recovered. Median cross-view reprojection differences are 3–6 mm in three directions and **22 mm for camera 1 → 3**; they include occlusion and are not an error measurement.
-- FoundationStereo has only been smoke-tested.
+- DUSt3R (previous method, full 96-frame runs) and FoundationStereo (smoke-tested only) stay available as alternatives.
 
-Next: compare the backends on a clearly loaded deformation clip against something known (a flat surface, a known displacement), with the 0.17 mm calibration floor above as the reference.
+Next: check DA3 on a clearly loaded deformation clip against something known (a flat surface, a known displacement), with the 0.17 mm calibration floor above as the reference, and look into the 1 → 3 discrepancy. One 0–0.5 s clip says nothing yet about temporal consistency under load or millimetre-level deformation accuracy.
 
 **Known problems, in the order they will bite:**
 
@@ -252,7 +254,7 @@ Next: compare the backends on a clearly loaded deformation clip against somethin
 
 ## 6. What Comes Next
 
-1. Reproduce the four-camera + tactile capture and the shape-reconstruction result of the predecessor paper, now with the calibrated multi-view depth + MVTracker reconstruction as shape ground truth, once a depth backend is chosen (§5).
+1. Reproduce the four-camera + tactile capture and the shape-reconstruction result of the predecessor paper, now with the calibrated DA3 + MVTracker reconstruction as shape ground truth, once its accuracy is checked (§5).
 2. Add force: train *tactile → shape + contact force*, keeping the camera-free / zero-shot properties.
 3. With measured force + reconstructed deformation, move toward real-world material/physical understanding and robot applications (force-aware soft grippers, contact-rich data collection for embodied AI).
 
