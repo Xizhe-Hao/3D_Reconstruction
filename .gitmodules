@@ -4,3 +4,9 @@
 [submodule "reconstruction/submodule/duster"]
 	path = reconstruction/submodule/duster
 	url = https://github.com/ethz-vlg/duster.git
+[submodule "reconstruction/submodule/FoundationStereo"]
+	path = reconstruction/submodule/FoundationStereo
+	url = https://github.com/NVlabs/FoundationStereo.git
+[submodule "reconstruction/submodule/depth-anything-3"]
+	path = reconstruction/submodule/depth-anything-3
+	url = https://github.com/bytedance-seed/depth-anything-3.git

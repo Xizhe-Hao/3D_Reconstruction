@@ -7,8 +7,12 @@ project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 mvtracker_dir="${project_dir}/submodule/mvtracker"
 session_dir="${SESSION_DIR:-${project_dir}/data/test}"
 output_dir="${OUTPUT_DIR:-${project_dir}/outputs/data_test}"
-start_frame="${START_FRAME:-0}"
-end_frame="${END_FRAME:-1414}"
+start_seconds="${START_SECONDS:-0}"
+end_seconds="${END_SECONDS:-}"
+end_args=()
+if [[ -n "${end_seconds}" ]]; then
+  end_args=(--end "${end_seconds}")
+fi
 target_frames="${TARGET_FRAMES:-96}"
 ga_niter="${DUSTER_GA_NITER:-300}"
 confidence="${DUSTER_CONFIDENCE:-20}"
@@ -20,8 +24,7 @@ point_stride="${POINTCLOUD_PIXEL_STRIDE:-2}"
 
 conda run --no-capture-output -n mvtracker python "${project_dir}/scripts/run_test_session.py" \
   --session-dir "${session_dir}" \
-  --start "${start_frame}" \
-  --end "${end_frame}" \
+  --start "${start_seconds}" \
   --target-frames "${target_frames}" \
   --max-frames "${target_frames}" \
   --depth-backend duster \
@@ -37,4 +40,5 @@ conda run --no-capture-output -n mvtracker python "${project_dir}/scripts/run_te
   --pointcloud-radius-m 0.5 \
   --rerun-pointcloud-mode fused \
   --output-dir "${output_dir}" \
+  "${end_args[@]}" \
   "$@"

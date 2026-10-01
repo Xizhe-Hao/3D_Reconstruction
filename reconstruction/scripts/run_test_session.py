@@ -1,8 +1,10 @@
 """Run pretrained MVTracker on a synchronized ``data/test`` clip.
 
 The result is a sparse 4D point trajectory rather than a dense deforming mesh.
-Use ``--depth-backend duster`` for calibrated multi-view depth, ``moge2`` for a
-fast monocular baseline, or ``npz`` for externally computed metric depth maps.
+Use ``--depth-backend duster`` for calibrated multi-view depth,
+``da3`` for pose-conditioned giant depth,
+``foundationstereo`` for rectified metric stereo, ``moge2`` for a fast
+monocular baseline, or ``npz`` for externally computed metric depth maps.
 """
 
 from __future__ import annotations
@@ -29,7 +31,9 @@ for index, path in enumerate((PROJECT_ROOT, MVTRACKER_ROOT)):
         sys.path.insert(index, str(path))
 
 from scripts.test_session_adapter import SessionClip, load_session_clip
+from scripts.da3_depth_backend import estimate_depths_with_da3
 from scripts.duster_depth_backend import estimate_depths_with_duster
+from scripts.foundationstereo_depth_backend import estimate_depths_with_foundationstereo
 
 
 _RUN_STARTED = time.perf_counter()
@@ -72,7 +76,7 @@ def inference_heartbeat(enabled: bool, device: str, interval_s: float):
 def load_or_estimate_depths(args: argparse.Namespace, clip: SessionClip, run_dir: Path) -> np.ndarray:
     V, T, _, H, W = clip.rgbs.shape
     cache_path = run_dir / f"depths_{args.depth_backend}_m.npz"
-    if cache_path.is_file() and not args.recompute_depth:
+    if cache_path.is_file() and not args.recompute_depth and args.depth_backend not in ("foundationstereo", "da3"):
         report("3/8 depth", f"loading cache {cache_path}", not args.no_progress)
         data = np.load(cache_path)
         depths = data["depths_m"]
@@ -90,8 +94,12 @@ def load_or_estimate_depths(args: argparse.Namespace, clip: SessionClip, run_dir
             depths = np.stack([depths[:, lookup[int(frame)]] for frame in clip.frame_indices], axis=1)
         if args.depth_unit == "mm":
             depths = depths / 1000.0
+    elif args.depth_backend == "da3":
+        depths = estimate_depths_with_da3(args, clip, run_dir, report)
     elif args.depth_backend == "duster":
         depths = estimate_depths_with_duster(args, clip, run_dir, report)
+    elif args.depth_backend == "foundationstereo":
+        depths, args.foundationstereo_dense_counts = estimate_depths_with_foundationstereo(args, clip, run_dir, report)
     elif args.depth_backend == "moge2":
         report("3/8 depth", f"loading MoGe-2 model {args.moge_model}", not args.no_progress)
         try:
@@ -369,12 +377,33 @@ def parse_roi(value: str) -> tuple[float, float, float, float]:
     return parts
 
 
+def seconds_to_frame_range(
+    session_dir: Path, start_s: float, end_s: float | None
+) -> tuple[int, int | None, float, int]:
+    """Convert an inclusive time range to synchronized video frame indices."""
+    export_path = session_dir.expanduser().resolve() / "multimodal_video_export.json"
+    try:
+        export = json.loads(export_path.read_text(encoding="utf-8"))
+        fps = float(export["fps"])
+        frame_count = int(export["frame_count"])
+    except (OSError, KeyError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Cannot read video timing from {export_path}: {exc}") from exc
+    duration_s = frame_count / fps
+    if not np.isfinite(start_s) or start_s < 0 or start_s >= duration_s:
+        raise ValueError(f"--start must satisfy 0 <= start < {duration_s:.6f} seconds")
+    if end_s is not None and (not np.isfinite(end_s) or end_s < start_s or end_s > duration_s + 1e-9):
+        raise ValueError(f"--end must satisfy start <= end <= {duration_s:.6f} seconds")
+    start_frame = int(np.ceil(start_s * fps - 1e-9))
+    end_frame = None if end_s is None else min(frame_count - 1, int(np.floor(end_s * fps + 1e-9)))
+    return start_frame, end_frame, fps, frame_count
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--session-dir", type=Path, default=PROJECT_ROOT / "data/test")
-    parser.add_argument("--start", type=int, default=0)
-    parser.add_argument("--end", type=int)
-    parser.add_argument("--step", type=int, default=1)
+    parser.add_argument("--start", type=float, default=0.0, help="Start time in video seconds")
+    parser.add_argument("--end", type=float, help="Inclusive end time in video seconds; default: video end")
+    parser.add_argument("--step", type=int, default=1, help="Frame stride when --target-frames is omitted")
     parser.add_argument(
         "--target-frames", type=int,
         help="Uniformly sample exactly N synchronized timestamps, including range endpoints",
@@ -382,7 +411,11 @@ def main() -> None:
     parser.add_argument("--max-frames", type=int, default=96)
     parser.add_argument("--width", type=int, default=512)
     parser.add_argument("--height", type=int, default=384)
-    parser.add_argument("--depth-backend", choices=["duster", "moge2", "npz"], default="duster")
+    parser.add_argument("--depth-backend", choices=["duster", "foundationstereo", "da3", "moge2", "npz"], default="duster")
+    parser.add_argument("--da3-python", type=Path, default=PROJECT_ROOT / ".venv-da3/bin/python")
+    parser.add_argument("--da3-model", type=Path, default=PROJECT_ROOT / "outputs/models/DA3-GIANT")
+    parser.add_argument("--da3-process-res", type=int, default=504)
+    parser.add_argument("--da3-confidence-percentile", type=float, default=10.0)
     parser.add_argument("--depth-path", type=Path)
     parser.add_argument("--depth-unit", choices=["m", "mm"], default="m")
     parser.add_argument("--moge-model", default="Ruicheng/moge-2-vitl-normal")
@@ -393,6 +426,15 @@ def main() -> None:
     parser.add_argument("--duster-ga-lr", type=float, default=0.01)
     parser.add_argument("--duster-conf-threshold", type=float, default=20.0)
     parser.add_argument("--duster-no-clean-depth", action="store_true")
+    parser.add_argument("--foundationstereo-root", type=Path, default=PROJECT_ROOT / "submodule/FoundationStereo")
+    parser.add_argument("--foundationstereo-checkpoint", type=Path, default=PROJECT_ROOT / "submodule/FoundationStereo/pretrained_models/23-51-11/model_best_bp2.pth")
+    parser.add_argument("--foundationstereo-conda-env", default="foundation_stereo")
+    parser.add_argument("--foundationstereo-pairs", default="0-2,1-3")
+    parser.add_argument("--foundationstereo-valid-iters", type=int, default=32)
+    parser.add_argument("--foundationstereo-hiera", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--foundationstereo-hiera-small-ratio", type=float, default=0.25)
+    parser.add_argument("--foundationstereo-lr-consistency-px", type=float, default=1.0)
+    parser.add_argument("--foundationstereo-scale", type=float, default=1.0)
     parser.add_argument("--depth-batch-size", type=int, default=4)
     parser.add_argument("--recompute-depth", action="store_true")
     parser.add_argument("--min-depth-m", type=float, default=0.03)
@@ -418,6 +460,8 @@ def main() -> None:
     args = parser.parse_args()
     if not args.output_dir.is_absolute():
         args.output_dir = PROJECT_ROOT / args.output_dir
+    if args.da3_process_res < 14 or not 0 <= args.da3_confidence_percentile < 100:
+        parser.error("DA3 resolution must be >=14 and confidence percentile in [0,100)")
     show_progress = not args.no_progress
     if args.heartbeat_seconds <= 0:
         parser.error("--heartbeat-seconds must be positive")
@@ -425,6 +469,14 @@ def main() -> None:
         parser.error("--duster-ga-niter must be non-negative and --duster-ga-lr positive")
     if args.duster_conf_threshold <= 0:
         parser.error("--duster-conf-threshold must be positive")
+    if args.foundationstereo_valid_iters <= 0:
+        parser.error("--foundationstereo-valid-iters must be positive")
+    if not 0 < args.foundationstereo_hiera_small_ratio <= 1:
+        parser.error("--foundationstereo-hiera-small-ratio must satisfy 0 < ratio <= 1")
+    if args.foundationstereo_lr_consistency_px < 0:
+        parser.error("--foundationstereo-lr-consistency-px cannot be negative")
+    if not 0 < args.foundationstereo_scale <= 1:
+        parser.error("--foundationstereo-scale must satisfy 0 < scale <= 1")
     if args.pointcloud_pixel_stride <= 0:
         parser.error("--pointcloud-pixel-stride must be positive")
     if args.pointcloud_radius_m <= 0 or args.pointcloud_point_radius_m <= 0:
@@ -442,13 +494,19 @@ def main() -> None:
 
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but torch.cuda.is_available() is false")
+    try:
+        start_frame, end_frame, video_fps, frame_count = seconds_to_frame_range(args.session_dir, args.start, args.end)
+    except ValueError as exc:
+        parser.error(str(exc))
     sampling_name = f"target_{args.target_frames}" if args.target_frames is not None else f"step_{args.step}"
-    run_name = f"frames_{args.start}_{args.end}_{sampling_name}_{args.depth_backend}"
+    start_name = f"{args.start:g}"
+    end_name = "end" if args.end is None else f"{args.end:g}"
+    run_name = f"seconds_{start_name}_{end_name}_{sampling_name}_{args.depth_backend}"
     run_dir = (args.output_dir / run_name).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
-    report("2/8 decode", f"loading synchronized session {args.session_dir}", show_progress)
+    report("2/8 decode", f"loading {args.session_dir}; seconds={start_name}..{end_name}, frames={start_frame}..{frame_count - 1 if end_frame is None else end_frame} at {video_fps:g} fps", show_progress)
     clip = load_session_clip(
-        args.session_dir, args.start, args.end, args.step, (args.width, args.height), args.max_frames,
+        args.session_dir, start_frame, end_frame, args.step, (args.width, args.height), args.max_frames,
         args.target_frames,
         show_progress,
     )
@@ -546,8 +604,8 @@ def main() -> None:
     ):
         valid = visibility[t] & np.isfinite(tracks_m[t]).all(axis=1)
         save_ply(ply_dir / f"tracks_{int(frame_index):06d}.ply", tracks_m[t, valid], colors[valid])
-    dense_counts = []
-    if not args.no_dense_ply:
+    dense_counts = getattr(args, "foundationstereo_dense_counts", [])
+    if not args.no_dense_ply and args.depth_backend != "foundationstereo":
         report("7/8 files", f"exporting fused dense PLY with pixel stride {args.pointcloud_pixel_stride}", show_progress)
         dense_counts = export_dense_ply(
             run_dir / "ply_dense", clip, depths_m, args.pointcloud_pixel_stride,
@@ -570,8 +628,20 @@ def main() -> None:
         "camera_serials": clip.camera_serials,
         "depth_backend": args.depth_backend,
         "target_frames": args.target_frames,
+        "requested_time_range_s": [args.start, args.end],
         "query_views": query_views,
         "query_voxel_size_m": args.query_voxel_size_m,
+        "da3": {"model": str(args.da3_model.resolve()),
+                "process_res": args.da3_process_res,
+                "confidence_percentile": args.da3_confidence_percentile,
+                "align_to_input_ext_scale": True}
+        if args.depth_backend == "da3" else None,
+        "foundationstereo": {
+            "pairs": args.foundationstereo_pairs, "valid_iters": args.foundationstereo_valid_iters,
+            "hiera": args.foundationstereo_hiera, "hiera_small_ratio": args.foundationstereo_hiera_small_ratio,
+            "scale": args.foundationstereo_scale,
+            "lr_consistency_px": args.foundationstereo_lr_consistency_px,
+        } if args.depth_backend == "foundationstereo" else None,
         "dense_pointcloud": {
             "pixel_stride": args.pointcloud_pixel_stride,
             "radius_m": args.pointcloud_radius_m,

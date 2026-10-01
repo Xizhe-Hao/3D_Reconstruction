@@ -1,0 +1,12 @@
+[submodule "submodule/mvtracker"]
+	path = submodule/mvtracker
+	url = https://github.com/ethz-vlg/mvtracker.git
+[submodule "submodule/duster"]
+	path = submodule/duster
+	url = https://github.com/ethz-vlg/duster.git
+[submodule "submodule/FoundationStereo"]
+	path = submodule/FoundationStereo
+	url = https://github.com/NVlabs/FoundationStereo.git
+[submodule "submodule/depth-anything-3"]
+	path = submodule/depth-anything-3
+	url = https://github.com/bytedance-seed/depth-anything-3.git

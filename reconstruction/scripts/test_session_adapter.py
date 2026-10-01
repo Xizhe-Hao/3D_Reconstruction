@@ -1,4 +1,4 @@
-"""Adapter for the synchronized four-camera ``data/test`` session.
+"""Adapter for synchronized four-camera capture sessions.
 
 The MVTracker tensors produced here follow the upstream convention:
 
@@ -61,6 +61,19 @@ def _read_json(path: Path) -> dict:
         raise SessionFormatError(f"Cannot read JSON {path}: {exc}") from exc
 
 
+def _find_calibration_file(session_dir: Path) -> Path:
+    """Locate calibration metadata in supported session layouts."""
+    candidates = (
+        session_dir / "calibration.json",
+        session_dir / "calibration" / "calibration.json",
+    )
+    for path in candidates:
+        if path.is_file():
+            return path
+    attempted = ", ".join(str(path) for path in candidates)
+    raise SessionFormatError(f"Missing required calibration file; tried: {attempted}")
+
+
 def _select_indices(
     frame_count: int, start: int, end: int | None, step: int, target_frames: int | None = None
 ) -> list[int]:
@@ -88,18 +101,23 @@ def _select_indices(
 def load_session_metadata(session_dir: Path) -> tuple[list[CameraSpec], list[dict], dict]:
     session_dir = session_dir.expanduser().resolve()
     export = _read_json(session_dir / "multimodal_video_export.json")
-    calibration = _read_json(session_dir / "calibration.json")
+    calibration = _read_json(_find_calibration_file(session_dir))
     alignment_path = session_dir / export.get("alignment", "multimodal_video_alignment.csv")
-    if not alignment_path.is_file():
-        raise SessionFormatError(f"Missing alignment CSV: {alignment_path}")
-
-    with alignment_path.open("r", newline="", encoding="utf-8-sig") as handle:
-        alignment = list(csv.DictReader(handle))
     frame_count = int(export.get("frame_count", -1))
-    if frame_count <= 0 or len(alignment) != frame_count:
-        raise SessionFormatError(
-            f"Alignment has {len(alignment)} rows but export declares {frame_count} frames"
-        )
+    if frame_count <= 0:
+        raise SessionFormatError(f"Invalid exported frame count: {frame_count}")
+    fps = float(export.get("fps", -1))
+    if not np.isfinite(fps) or fps <= 0:
+        raise SessionFormatError(f"Invalid exported frame rate: {fps}")
+
+    # Alignment tables contain sensor/force associations and can legitimately
+    # come from a shorter or different recording. Video decoding is indexed by
+    # the exported videos themselves, so do not use alignment row count or its
+    # timestamps to define the video timeline.
+    alignment: list[dict] = []
+    if alignment_path.is_file():
+        with alignment_path.open("r", newline="", encoding="utf-8-sig") as handle:
+            alignment = list(csv.DictReader(handle))
     if int(export.get("camera_count", -1)) != 4:
         raise SessionFormatError("This adapter expects exactly four synchronized cameras")
     if calibration.get("pose_convention") != "X_cam = R_world_to_cam @ X_world + t_world_to_cam":
@@ -220,7 +238,7 @@ def load_session_clip(
     extrs = np.repeat(
         np.stack([camera.extrinsic_w2c_m for camera in cameras])[:, None], T, axis=1
     ).astype(np.float32)
-    times = np.asarray([float(alignment[i]["video_time_s"]) for i in frame_indices], dtype=np.float64)
+    times = np.asarray(frame_indices, dtype=np.float64) / float(export["fps"])
     return SessionClip(
         rgbs=rgbs,
         intrinsics=intrs,

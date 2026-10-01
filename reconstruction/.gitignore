@@ -1,0 +1,42 @@
+# Local datasets and generated reconstruction artifacts
+data/
+outputs/
+
+# Model weights and large binary assets
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.onnx.tmp
+*.safetensors
+*.npz
+*.npy
+*.rrd
+*.ply
+*.mp4
+*.avi
+*.mov
+
+# Checkpoint/cache directories at any depth
+**/checkpoints/
+.cache/
+
+# Python and tooling
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.idea/
+.vscode/
+.DS_Store
+
+# Runtime files
+logs/
+wandb/
+*.log
+
+/submodule/MoGe/
+
+.venv-da3/
