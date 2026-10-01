@@ -1,0 +1,6 @@
+[submodule "reconstruction/submodule/mvtracker"]
+	path = reconstruction/submodule/mvtracker
+	url = https://github.com/ethz-vlg/mvtracker.git
+[submodule "reconstruction/submodule/duster"]
+	path = reconstruction/submodule/duster
+	url = https://github.com/ethz-vlg/duster.git
