@@ -51,8 +51,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bayer", default=None,
                         help="override the Bayer pattern (BG/RG/GB/GR/none); "
                              "default is read from session.json")
-    parser.add_argument("--subpix-win", default="auto",
-                        help="cornerSubPix half-window in px, or 'auto', or 0 to skip")
+    # Default 0: the ChArUco detector already refines its corners, and a second
+    # cornerSubPix pass made them WORSE on this rig. On the 2026-09-30 session's
+    # static world frames (board lying still, so frame-to-frame jitter is only
+    # 0.04-0.08 px) the single-view PnP residual per camera was
+    # 0.47/0.68/0.81/0.69 px with 'auto' and 0.41/0.46/0.39/0.57 px with 0.
+    parser.add_argument("--subpix-win", default="0",
+                        help="extra cornerSubPix half-window in px, 'auto', or 0 "
+                             "to keep the ChArUco detector's own refinement")
     parser.add_argument("--workers", type=int, default=0,
                         help="detection threads; 0 = one per CPU")
     parser.add_argument("--debug-dir", type=Path, default=None,

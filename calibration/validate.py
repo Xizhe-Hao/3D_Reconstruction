@@ -241,9 +241,16 @@ def main() -> int:
 
     print()
     print("accuracy")
-    rows = [
+    # Intrinsics reused from an earlier calibration (calibrate.py
+    # --intrinsics-from) were not solved here, so their old fit RMS says nothing
+    # about this session and is shown for reference, not graded. Whether they
+    # still fit is reported as the per-view fit on this session's data.
+    reused = all("intrinsics_reused_from" in c for c in cameras)
+    rows = [] if reused else [
         ("worst per-camera intrinsics RMS", metrics["intrinsics_rms_px_worst"],
          THRESHOLDS["intrinsics_rms_px"], "px", False),
+    ]
+    rows += [
         ("multi-view solve RMS", metrics["multiview_rms_px"],
          THRESHOLDS["multiview_rms_px"], "px", False),
         (f"{args.frames} re-projection RMS", metrics["holdout_reprojection_rms_px"],
@@ -257,6 +264,10 @@ def main() -> int:
         ("median triangulation parallax", metrics["median_parallax_deg"],
          THRESHOLDS["median_parallax_deg"], "deg", True),
     ]
+    if reused:
+        fit = max(c.get("intrinsics_reuse_fit_px", float("nan")) for c in cameras)
+        print(f"  [INFO] intrinsics reused, not graded   worst per-view fit on this "
+              f"session {fit:.3f} px (solved at {metrics['intrinsics_rms_px_worst']:.3f} px)")
     failures = 0
     for label, value, limit, unit, higher in rows:
         state = verdict(label, value, limit, higher)

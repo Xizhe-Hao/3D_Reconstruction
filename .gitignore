@@ -51,3 +51,8 @@ reconstruction/submodule/MoGe/
 *.onnx
 *.rrd
 *.ply
+
+# Camera-moved checks and cell checks (images, reports)
+calibration/camera_check/
+sensor-data-collection/test/cell_check/
+calibration/board_d455/*.png

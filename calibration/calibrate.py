@@ -74,6 +74,13 @@ def parse_args() -> argparse.Namespace:
                        help="cap per camera; more views mostly cost time")
     group.add_argument("--reject-view-rms", type=float, default=1.0,
                        help="drop views worse than this many px and refit once")
+    group.add_argument("--intrinsics-from", type=Path, default=None, metavar="JSON",
+                       help="reuse K and distortion from an earlier calibration.json "
+                            "(matched by serial) instead of fitting them here. Valid "
+                            "only while no lens has been refocused, zoomed or had its "
+                            "iris touched; then a session only has to pin down where "
+                            "the cameras are, which takes far fewer poses than the "
+                            "intrinsics do.")
 
     group = parser.add_argument_group("multi-view")
     group.add_argument("--common-corners", type=int, default=0, metavar="N",
@@ -235,6 +242,46 @@ def calibrate_intrinsics(object_points, corners, counts, image_size, args):
     }
 
 
+def load_intrinsics(path: Path, serials, image_sizes):
+    """K and distortion per camera, by serial, from an earlier calibration.json."""
+    previous = json.loads(path.read_text(encoding="utf-8"))
+    by_serial = {camera["serial"]: camera for camera in previous["cameras"]}
+    out = []
+    for ci, serial in enumerate(serials):
+        if serial not in by_serial:
+            raise SystemExit(f"{path} has no camera {serial}")
+        camera = by_serial[serial]
+        if [int(v) for v in camera["image_size"]] != [int(v) for v in image_sizes[ci]]:
+            raise SystemExit(f"camera {serial}: image size {camera['image_size']} in "
+                             f"{path} differs from {list(image_sizes[ci])} here")
+        dist = np.asarray(camera["dist"], np.float64).reshape(1, -1)
+        out.append({
+            "K": np.asarray(camera["K"], np.float64), "dist": dist,
+            "rms": float(camera.get("intrinsics_rms_px", float("nan"))),
+            "views": int(camera.get("intrinsics_views", 0)), "rejected": 0,
+            "flags": DIST_MODELS.get(camera.get("dist_model", "standard"), 0),
+            "reused_from": str(path),
+        })
+    return out
+
+
+def reuse_residual(object_points, corners, counts, K, dist, args) -> float:
+    """Median per-view RMS of this session's views under fixed intrinsics."""
+    values = []
+    for fi in np.flatnonzero(counts >= args.min_corners_intrinsics):
+        valid = corners[fi, :, 0] >= 0
+        obj = np.ascontiguousarray(object_points[valid], np.float64)
+        img = np.ascontiguousarray(corners[fi, valid], np.float64).reshape(-1, 1, 2)
+        ok, rvec, tvec = cv.solvePnP(obj, img, K, dist, flags=cv.SOLVEPNP_ITERATIVE)
+        if not ok:
+            continue
+        rvec, tvec = cv.solvePnPRefineLM(obj, img, K, dist, rvec, tvec)
+        projected, _ = cv.projectPoints(obj, rvec, tvec, K, dist)
+        values.append(float(np.sqrt(np.mean(np.sum(
+            (projected.reshape(-1, 2) - img.reshape(-1, 2)) ** 2, axis=1)))))
+    return float(np.median(values)) if values else float("nan")
+
+
 def board_pose_in_camera(object_points, image_points, K, dist):
     """solvePnP on the detected subset only, refined with LM."""
     valid = image_points[:, 0] >= 0
@@ -269,24 +316,7 @@ def main() -> int:
           f"{num_pts} corners)")
     print(f"board     : {spec.describe()}")
 
-    # -------------------------------------------------------- 1. intrinsics
-    print()
-    print("1) intrinsics, per camera, from detected corners only")
-    intrinsics = []
-    for ci in range(num_cams):
-        result = calibrate_intrinsics(object_points, corners[ci], counts[ci],
-                                      image_sizes[ci], args)
-        intrinsics.append(result)
-        K = result["K"]
-        print(f"   cam {ci} ({serials[ci]}): rms {result['rms']:.4f} px  "
-              f"views {result['views']}"
-              + (f" (rejected {result['rejected']})" if result["rejected"] else "")
-              + f"  f=({K[0,0]:.1f}, {K[1,1]:.1f})  c=({K[0,2]:.1f}, {K[1,2]:.1f})")
-        if result["rms"] > 0.5:
-            print("        WARNING: > 0.5 px. Check focus, motion blur, and that the")
-            print("        board is rigid and fills the frame in some views.")
-
-    # ------------------------------------------------- 2. multi-view solving
+    # ------------------------------------------- 1. frame selection + holdout
     # Whatever selection we make, the invariant is the same: every corner handed
     # to `calibrateMultiview` for an enabled camera/frame cell was really
     # observed. No (-1, -1) placeholder ever reaches it.
@@ -297,13 +327,13 @@ def main() -> int:
         enabled = detected[:, :, point_ids].all(axis=2)
         extent = object_points[point_ids]
         span = extent.max(axis=0) - extent.min(axis=0)
-        print(f"2) multi-view on a common sub-pattern of {point_ids.size} corners "
+        print(f"1) multi-view on a common sub-pattern of {point_ids.size} corners "
               f"spanning {span[0]:.0f}x{span[1]:.0f} mm of the board")
         print("   (a cell counts when it sees ALL of them, so the observations stay exact)")
     else:
         point_ids = np.arange(num_pts)
         enabled = counts == num_pts
-        print(f"2) multi-view on the complete {num_pts}-corner board")
+        print(f"1) multi-view on the complete {num_pts}-corner board")
     subset_points = object_points[point_ids]
     num_subset = point_ids.size
 
@@ -315,13 +345,72 @@ def main() -> int:
             "views actually share."
         )
 
-    holdout_mask = block_holdout(usable_frames.size, args.holdout_frac, args.holdout_block)
-    calib_frames = usable_frames[~holdout_mask]
-    holdout_frames = usable_frames[holdout_mask]
+    # The world segment is one static pose recorded a dozen times. Holding it
+    # out (it is the first block of the session, exactly where block_holdout
+    # starts) makes validate.py grade the calibration on a single pose -- the
+    # 2026-09-30 session did precisely that. Hold out from the moving steps.
+    world_lo, world_hi = (int(v) for v in args.world_frames.split(":")) \
+        if args.world_frames else (0, 0)
+    in_world = (frame_indices[usable_frames] >= world_lo) & \
+               (frame_indices[usable_frames] < world_hi)
+    moving = usable_frames[~in_world]
+    # A short session (the 2026-10-08 one had 20 moving poses) cannot spare two
+    # blocks of 10; shrink the block rather than validate on nothing.
+    block = args.holdout_block
+    if moving.size < 2 * block and moving.size >= 5:
+        block = max(1, moving.size // 5)
+        print(f"   short session: holding out blocks of {block} frames")
+    holdout_mask = block_holdout(moving.size, args.holdout_frac, block)
+    holdout_frames = moving[holdout_mask]
+    calib_frames = np.setdiff1d(usable_frames, holdout_frames)
     calib_frames = uniform_subset(calib_frames, args.max_frames)
     print(f"   frames: {usable_frames.size} usable -> {calib_frames.size} for the solve, "
           f"{holdout_frames.size} held out for validation")
 
+    # -------------------------------------------------------- 2. intrinsics
+    print()
+    print("2) intrinsics, per camera, from detected corners only")
+    intrinsics = []
+    # Held-out frames are excluded here too: validate.py re-projects them
+    # through these intrinsics, so fitting on them would flatter the result.
+    fit_counts = counts.copy()
+    fit_counts[:, holdout_frames] = 0
+    reused = load_intrinsics(args.intrinsics_from, serials, image_sizes) \
+        if args.intrinsics_from else None
+    if reused:
+        print(f"   reusing K and distortion from {args.intrinsics_from}")
+    for ci in range(num_cams):
+        if reused:
+            result = reused[ci]
+            # The check that the lens is still the one those numbers describe:
+            # fit each view's board pose with the reused intrinsics. A refocused
+            # lens shows up here as a residual far above the one it was fitted at.
+            fit = reuse_residual(object_points, corners[ci], fit_counts[ci],
+                                 result["K"], result["dist"], args)
+            result["reuse_rms"] = fit
+            K = result["K"]
+            print(f"   cam {ci} ({serials[ci]}): reused  f=({K[0,0]:.1f}, {K[1,1]:.1f})"
+                  f"  c=({K[0,2]:.1f}, {K[1,2]:.1f})  per-view fit on this session "
+                  f"{fit:.3f} px (was {result['rms']:.3f} px when solved)")
+            if fit > max(1.0, 2.0 * result["rms"]):
+                print("        WARNING: these intrinsics fit this session poorly. If a lens")
+                print("        was refocused, re-solve intrinsics instead of reusing them.")
+        else:
+            result = calibrate_intrinsics(object_points, corners[ci], fit_counts[ci],
+                                          image_sizes[ci], args)
+            K = result["K"]
+            print(f"   cam {ci} ({serials[ci]}): rms {result['rms']:.4f} px  "
+                  f"views {result['views']}"
+                  + (f" (rejected {result['rejected']})" if result["rejected"] else "")
+                  + f"  f=({K[0,0]:.1f}, {K[1,1]:.1f})  c=({K[0,2]:.1f}, {K[1,2]:.1f})")
+            if result["rms"] > 0.5:
+                print("        WARNING: > 0.5 px. Check focus, motion blur, and that the")
+                print("        board is rigid and fills the frame in some views.")
+        intrinsics.append(result)
+
+    # ----------------------------------------------- 3. multi-view solving
+    print()
+    print("3) multi-view solve")
     mask = enabled[:, calib_frames].astype(np.uint8)
     for ci in range(num_cams):
         if mask[ci].sum() < 10:
@@ -398,16 +487,20 @@ def main() -> int:
     refine_info = None
     if not args.no_refine:
         print()
-        print("2b) bundle adjustment over every detected corner")
+        print("3b) bundle adjustment over every detected corner")
+        # Held-out frames must stay unseen, or validate.py grades the fit on
+        # data it was fitted to.
+        training = corners.copy()
+        training[:, holdout_frames] = -1.0
         Rs_ref, Ts_ref, refine_info = bundle.refine(
-            corners, object_points,
+            training, object_points,
             [item["K"] for item in intrinsics],
             [item["dist"] for item in intrinsics],
             [pose[0] for pose in poses], [pose[1] for pose in poses])
         poses = [(as_rotation_matrix(np.asarray(R)), np.asarray(t, np.float64).reshape(3))
                  for R, t in zip(Rs_ref, Ts_ref)]
 
-    # ----------------------------------------------------- 3. world frame
+    # ----------------------------------------------------- 4. world frame
     print()
     world_info = {"origin": "camera_0", "frames": [], "z_offset_mm": args.world_z_offset,
                   "flip_z": bool(args.world_flip_z)}
@@ -438,7 +531,7 @@ def main() -> int:
             )
         R_w, t_w, spread = average_rigid(rotations, translations)
         world_info.update({"origin": "board", "frames": sorted(set(used)), "spread": spread})
-        print(f"3) world frame from {len(rotations)} board observations in "
+        print(f"4) world frame from {len(rotations)} board observations in "
               f"{len(set(used))} frames")
         print(f"   spread: {spread['max_rotation_deg']:.3f} deg, "
               f"{spread['max_translation_mm']:.3f} mm max deviation")
@@ -446,7 +539,7 @@ def main() -> int:
             print("   WARNING: the 'static' board moved, or one camera disagrees.")
             print("   Re-shoot the world-frame segment with the board truly still.")
     else:
-        print("3) world frame = camera 0 (no --world-frames given).")
+        print("4) world frame = camera 0 (no --world-frames given).")
         print("   For tactile-array-referenced ground truth, re-run with a range of")
         print("   frames in which the board lay flat on the sensor platform.")
 
@@ -456,7 +549,7 @@ def main() -> int:
     if args.world_z_offset:
         t_w = t_w + R_w @ np.array([0.0, 0.0, float(args.world_z_offset)])
 
-    # ------------------------------------------------------------ 4. output
+    # ------------------------------------------------------------ 5. output
     cameras = []
     for ci in range(num_cams):
         R_c, t_c = poses[ci]
@@ -477,6 +570,9 @@ def main() -> int:
             "optical_axis_world": (R_wc.T @ np.array([0.0, 0.0, 1.0])).tolist(),
             "intrinsics_rms_px": intrinsics[ci]["rms"],
             "intrinsics_views": intrinsics[ci]["views"],
+            **({"intrinsics_reused_from": intrinsics[ci]["reused_from"],
+                "intrinsics_reuse_fit_px": intrinsics[ci]["reuse_rms"]}
+               if "reused_from" in intrinsics[ci] else {}),
             "multiview_rms_px": per_camera_rms[ci],
         })
 

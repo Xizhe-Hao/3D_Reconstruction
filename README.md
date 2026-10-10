@@ -120,11 +120,12 @@ python ..\..\calibration\check_stability.py --minutes 20     # does the rig hold
 python ..\..\calibration\tune_exposure.py --auto --gain-db 0 --max-exposure-us 40000
 python ..\..\calibration\capture_gui.py `
     --board ..\..\calibration\board\board.json `
-    --output C:\tactile_calib\guidedN --in-frame-frac 1.0
+    --output C:\tactile_calib\guidedN
 ```
 
 - `--gain-db 0` because the board is stationary: long exposure costs nothing and 18 dB of gain measurably degrades sub-pixel corner localisation. The auto-tuner cannot lower gain on its own once it is high, so set it explicitly.
-- `--in-frame-frac 1.0` because the default (0.85) records frames where a camera sees 119 of the 140 corners, while the strict multi-view solve only uses frames where it saw **all** of them. At 0.85 a session can finish looking healthy and leave the solver with nothing.
+- Take the soft object off the platform first: the world step lays the board flat where it sat, so z = 0 is that surface. Bring something to **rest** the board on; sets are recorded only when it is motionless.
+- The GUI plans the session from the world step: one step per pair of cameras that really stand next to each other, then one all-cameras step (5 steps on this rig, down from 9). A step that the space does not allow can be skipped; what it recorded is kept. Aim for 30+ moving poses in total. See [`calibration/README.md`](./calibration/README.md#3-capture).
 
 Recalibrate whenever a camera is moved or refocused; the reconstruction trusts these poses completely (DUSt3R's global alignment keeps them fixed). `check_stability.py` measures whether the rig holds still at all, and `session_report` prints per-camera drift after every guided session — a camera that moves mid-session cannot be calibrated at any residual.
 
@@ -227,16 +228,18 @@ Full details (Chinese): [`reconstruction/README.md`](./reconstruction/README.md)
 
 ## 5. Current state
 
-**Calibration** — [`calibration/calibration.json`](./calibration/calibration.json), solved 2026-09-30, rig stable throughout (0.00 px drift on all four cameras).
+**Calibration** — [`calibration/calibration.json`](./calibration/calibration.json), re-solved 2026-10-09 from `C:	actile_calib\guided10\capture_20261009_193915` (extrinsics only, intrinsics reused) after cameras were knocked while mounting the D455: held-out re-projection 0.39 px, inter-corner distance error P95 0.22 mm, worst pair epipolar 0.68 px. Feature matches on that session give 0.6-0.8 px epipolar error with it and 16-431 px with the 10-08 calibration, so sessions recorded before the knock need the 10-08 file (kept in its session folder). The 10-08 solve, for reference: from `C:	actile_calib\guided9\capture_20261008_180904` after the new tactile sensor was installed. Intrinsics are reused from the 2026-09-30 session ([`calibration/intrinsics_20260930.json`](./calibration/intrinsics_20260930.json), re-detected without the extra `cornerSubPix` pass); they fit the new session's views at 0.56-0.65 px, as well as when they were solved, so the lenses are unchanged. The camera-to-camera baselines match 2026-09-30 to within 0.5 mm: the rig itself did not move, only the world frame was redefined. World z = 0 is the platform with the soft object removed (`--world-z-offset -1.2`, the board's glass).
 
 ```
-inter-corner distance error P95   0.173 mm   (target ≤ 0.30)   PASS
-board rigid-fit residual RMS      0.100 mm   (target ≤ 0.20)   PASS
-worst per-camera intrinsics RMS   0.924 px   (target ≤ 0.30)   FAIL
-worst pair epipolar RMS           1.325 px   (target ≤ 1.00)   over
+inter-corner distance error P95   0.157 mm   all 32 frames     (0.104 mm on the 1-2 held-out frames)
+re-projection RMS                 0.437 px   all frames        (0.440 px held out)
+worst pair epipolar RMS           0.99 px    (target <= 1.00)
+worst per-camera intrinsics RMS   0.79 px    (target <= 0.30)  FAIL -- see below
 ```
 
-Usable, with **0.17 mm as the error floor** on any reconstructed shape. The metric rows are the acceptance criterion — focal length and range are coupled, so a millimetre error on held-out frames is the honest measure and a pixel residual is not. The pixel rows are over target for real reasons: the extrinsics came from a sub-pattern solve (80 shared corners, not the full 140) because two cameras rarely saw the whole board, and the intrinsics are under-determined because the board was never held square-on enough. Re-calibrating with `--in-frame-frac 1.0` and better facing is the fix; post-processing is not.
+Usable, with **~0.16 mm as the error floor**. The intrinsics row fails on every calibration of this rig and is not fixable by shooting differently: with the board lying still, corners jitter only 0.04-0.08 px between frames, and the remaining 0.4-0.6 px is a fixed per-corner bias of the printed target. The held-out set of this session is small (20 moving poses), so the all-frames figure is the one to quote. Camera 26224290 drifted 1.41 px during the session (marginal) -- check its mount.
+
+The previous calibration (2026-09-30) was reported at 0.17 mm, but that was measured on the static world pose only; on moving held-out frames it was 0.20-0.22 mm.
 
 **Reconstruction** — the current method is **Depth Anything 3 giant**. It runs end to end, but its depth has **not been checked against a known shape yet**.
 

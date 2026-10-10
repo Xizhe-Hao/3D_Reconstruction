@@ -5,6 +5,15 @@ This tool deliberately ignores source-file creation, modification, download,
 and email timestamps. It searches the complete tactile recording for the
 force-run placement that maximizes absolute Pearson correlation against
 multiple 16x16 sensor features.
+
+It also searches the force run's TIME SCALE. IntelliMESUR's "Time [s]" column
+is the reading number times the nominal interval (0.000, 0.010, 0.020, ...),
+not a clock. On 2026-10-08 a run labelled 100 Hz really sampled at ~86 Hz, so
+its timeline was 16% short. A shift-only search cannot fit that; on a run of
+repeated presses it then locks onto a placement ONE PRESS EARLY and still
+reports confidence=high (score 0.954 there, against 0.984 at the true scale).
+The scale found is applied to the force timeline before anything is written,
+so every output is in real seconds.
 """
 
 from __future__ import annotations
@@ -39,6 +48,8 @@ DEFAULT_COARSE_STEP_S = 0.10
 DEFAULT_REFINE_STEP_S = 0.005
 DEFAULT_AMBIGUITY_EXCLUSION_S = 1.0
 DEFAULT_MINIMUM_PEAK_MARGIN = 0.05
+DEFAULT_SCALE_RANGE = (0.80, 1.30)
+DEFAULT_SCALE_STEP = 0.01
 
 
 def parse_args():
@@ -103,7 +114,34 @@ def parse_args():
         default=DEFAULT_FORCE_MIN_CORRELATION,
         help="Minimum score for medium confidence.",
     )
+    parser.add_argument(
+        "--time-scale",
+        type=float,
+        default=None,
+        help=(
+            "Use this factor on the force timeline instead of searching for it "
+            "(1.0 trusts IntelliMESUR's nominal sample interval)."
+        ),
+    )
+    parser.add_argument(
+        "--scale-range",
+        type=float,
+        nargs=2,
+        default=DEFAULT_SCALE_RANGE,
+        metavar=("LOW", "HIGH"),
+        help="Range of force time scales to search.",
+    )
+    parser.add_argument(
+        "--scale-step",
+        type=float,
+        default=DEFAULT_SCALE_STEP,
+        help="Coarse step of the scale search; refined tenfold around the best.",
+    )
     args = parser.parse_args()
+    if args.time_scale is not None and args.time_scale <= 0:
+        parser.error("--time-scale must be positive")
+    if not 0 < args.scale_range[0] < args.scale_range[1]:
+        parser.error("--scale-range needs 0 < LOW < HIGH")
     if args.adc_ref <= 0 or args.vdrive <= 0:
         parser.error("--adc-ref and --vdrive must be positive")
     if args.coarse_step <= 0 or args.refine_step <= 0:
@@ -370,6 +408,58 @@ def find_curve_only_alignment(force, sensor, args):
     return best, features
 
 
+def find_alignment_with_scale(force, sensor, args):
+    """Search the time scale of the force run as well as its placement.
+
+    Returns (alignment, features, scaled_force). Scale 1.0 is always tried, and
+    its score is kept in the result so the gain from rescaling is visible.
+    """
+    def attempt(scale):
+        scaled = dict(force)
+        scaled["time_s"] = force["time_s"] * scale
+        try:
+            alignment, features = find_curve_only_alignment(scaled, sensor, args)
+        except (ValueError, RuntimeError):
+            return None
+        return alignment, features, scaled
+
+    if args.time_scale is not None:
+        found = attempt(args.time_scale)
+        if found is None:
+            raise SystemExit(f"no alignment at --time-scale {args.time_scale}")
+        found[0]["force_time_scale"] = float(args.time_scale)
+        return found
+
+    low, high = args.scale_range
+    grid = sorted(set(np.round(np.arange(low, high + 1e-9, args.scale_step), 4))
+                  | {1.0})
+    results = {scale: attempt(scale) for scale in grid}
+    results = {k: v for k, v in results.items() if v is not None}
+    if not results:
+        raise SystemExit("no time scale in --scale-range gives a valid alignment")
+    coarse = max(results, key=lambda k: results[k][0]["score"])
+    fine = np.round(np.arange(coarse - args.scale_step, coarse + args.scale_step + 1e-9,
+                              args.scale_step / 10), 4)
+    for scale in fine:
+        if scale not in results:
+            found = attempt(float(scale))
+            if found is not None:
+                results[float(scale)] = found
+    best_scale = max(results, key=lambda k: results[k][0]["score"])
+    alignment, features, scaled = results[best_scale]
+    unscaled = results.get(1.0)
+    alignment["force_time_scale"] = float(best_scale)
+    alignment["score_at_scale_1"] = (
+        float(unscaled[0]["score"]) if unscaled else None)
+    nominal_dt = float(np.median(np.diff(force["time_s"])))
+    if nominal_dt > 0:
+        alignment["force_effective_rate_hz"] = float(1.0 / (nominal_dt * best_scale))
+    if low >= best_scale - 1e-9 or best_scale >= high - 1e-9:
+        print(f"WARNING: the best time scale {best_scale:.3f} is at the edge of "
+              "--scale-range; widen it.")
+    return alignment, features, scaled
+
+
 def install_canonical_outputs(session, result):
     shutil.copy2(
         result["alignment_path"],
@@ -486,11 +576,7 @@ def main():
         vdrive=args.vdrive,
     )
     sensor = load_sensor_alignment_data(session, sensor_args)
-    alignment, features = find_curve_only_alignment(
-        force,
-        sensor,
-        args,
-    )
+    alignment, features, force = find_alignment_with_scale(force, sensor, args)
     output_stem = f"curve_only_{Path(record.archived_path).stem}"
     result = write_force_alignment_outputs(
         session,
@@ -525,6 +611,17 @@ def main():
         f"metric={alignment['metric']}, "
         f"peak_margin={alignment['peak_margin']:.3f}"
     )
+    scale = alignment.get("force_time_scale", 1.0)
+    rate = alignment.get("force_effective_rate_hz")
+    print(
+        f"Force time scale: {scale:.3f}"
+        + (f" (effective sample rate {rate:.1f} Hz)" if rate else "")
+        + (f"; score without rescaling {alignment['score_at_scale_1']:.3f}"
+           if alignment.get("score_at_scale_1") is not None else "")
+    )
+    if abs(scale - 1.0) > 0.02:
+        print("  IntelliMESUR's Time column did not match real time; the force "
+              "timeline has been rescaled.")
     print("Filesystem timestamps used: no")
     print(f"Updated video alignment rows: {aligned_video_frames}")
     print(f"Force import completed: {session}")

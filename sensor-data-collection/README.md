@@ -347,3 +347,59 @@ Use it to confirm the serial link and firmware are alive:
 python livesensor_view.py COM3
 python livesensor_view.py COM3 --raw    # also print per-frame stats
 ```
+
+## 4. Overhead RealSense D455 (independent depth reference)
+
+The D455 is a cross-check for the multi-view reconstruction on large
+deformations, not a finer ground truth: from its 52 cm minimum range it sees
+~0.8 mm per pixel on the sponge and measures depth to ~1-2 mm, against 0.16 mm
+for the calibrated Blackflys. Mount it rigidly on its own arm 55-60 cm above
+the sponge, tilted 20-30 deg so the Mark-10 crosshead does not hide the
+indenter, and clear of the Blackfly views. Needs `pyrealsense2` in the capture
+venv (`python -m pip install pyrealsense2 --no-deps`, keeps numpy 1.26).
+
+```powershell
+python record_d455.py --preview --near                  # aim it at ~0.40 m (shows the valid range)
+```
+
+`--near` is the close-range setup: 1280x720 depth plus a disparity shift
+(advanced mode) so the D455 measures 0.33-1.0 m instead of 0.49 m and beyond.
+At 40 cm that is ~0.2 mm depth noise in theory and ~0.6 mm per pixel; the
+background past 1 m drops out. The shift lives in the camera until power-off,
+so every run writes it, and a run without `--near` sets it back to 0. With the
+one-command capture add `--near` (before the `--`).
+
+**Every capture** -- start the D455 first, stop it last, then attach it:
+
+```powershell
+python record_d455.py --output C:\tactile_data\run01    # terminal 1, keep running
+python capture_3blackfly_sensor_force.py --port COM3 --cameras 4 --no-open-cell-interpolation --output C:\tactile_data\run01   # terminal 2
+#   ... Ctrl+C the capture, then Ctrl+C the D455 ...
+python align_d455.py C:\tactile_data\run01\capture_<stamp>
+```
+
+`align_d455.py` writes `<session>/d455/` with, for every frame set, the D455
+frame closest in time (`depth/<seq>.png` uint16, `color/<seq>.jpg`,
+`frames.csv` with the time difference). Synchronisation is by timestamp: the
+D455 free-runs at 30 fps, so a match is at most ~17 ms off, which is ~0.1 mm of
+crosshead travel at 5 mm/s. Without the RealSense metadata driver on Windows its
+timestamps are host arrival times -- the same clock the Blackfly capture logs.
+Recordings are rosbag2 `.db3` (librealsense >= 2.57), ~60 MB/s at the default
+848x480 depth + colour; budget disk for it on top of the Blackflys.
+
+**Once per mounting** -- put the D455 into the world frame. Print
+`calibration/board_d455/charuco_7x10_25mm.pdf` at 100% on A4, glue it flat to a
+rigid sheet, measure a square and fix `square_mm` in its `board.json` (the 9 mm
+board is too small for the D455 to decode at 60 cm). Record as above with
+`record_d455.py --color-size 1280x720`, lay or prop the board still in 5-10
+places and tilts (~2 s each, some raised or tilted, not all flat), keep the
+BMPs, run `align_d455.py`, then in the calibration venv:
+
+```powershell
+python calibration\calibrate_d455.py <session> --install    # -> calibration\d455_world.json
+```
+
+It triangulates the board corners with the Blackflys (world frame), solves the
+D455 pose from the same corners in its colour image, and then checks the D455
+depth at those corners against the triangulated truth -- the D455's own depth
+error, in mm. Re-run it whenever the D455 or its arm is touched.

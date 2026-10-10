@@ -25,17 +25,29 @@ against the static scene and keeps running through the capture, so by the time
 the session ends it covers the whole half hour.
 
 **Capture.** The protocol is named a step at a time and a frame set is recorded
-only when the pose is genuinely right: the board still, square-on to the camera
-that needs it, sharing enough corners with its partner, and -- for the steps
+only when the pose is genuinely right: the board still, square-on to the cameras
+that need it, sharing enough corners with its partner, and -- for the steps
 that feed the multi-view solve -- entirely inside the frame. Detecting *the
 board* is not the same as seeing *all of* it, and the strict solve uses only
 frames where every corner was measured.
 
-It deliberately does not use the Arduino trigger. Hardware sync matters when the
-target moves between cameras' exposures; this protocol holds the board still and
-verifies stationarity in every contributing view before saving, which is the
-stricter condition. Calibration therefore does not depend on the sensor rig
-running at all.
+The plan is not fixed. Step 1 (board flat on the platform, the world frame) is
+also where every camera sees the same board, so the window works out from it
+where each camera stands around the board and plans the rest from that: one
+step per pair of cameras that really are neighbours (both see the board
+square-on at once, which feeds both intrinsics and their link), a face step
+only for a camera without a neighbour, and one all-cameras step. On this rig
+that is 5 steps instead of 9. The old fixed plan paired cameras by number, and
+two of its pairs face each other across the array, which no flat board serves.
+Pair steps also walk the board into the corners of each image, where lens
+distortion lives.
+
+The cameras are fired together by software trigger, so the images of one set
+are exposed within ~3 ms of each other. Free-running, they were up to a few
+hundred milliseconds apart, and a hand-held board that drifted in between
+became a different board in each view (18 of 92 frames on the 2026-09-30
+session). It still does not need the Arduino: calibration does not depend on
+the sensor rig running at all.
 
 **Verdict.** On "finish and save" the window closes and the session is graded:
 drift per camera, then detect_corners -> calibrate -> validate, then GOOD /
@@ -86,8 +98,10 @@ from PIL import Image, ImageTk  # noqa: E402
 
 from charuco_board import BoardSpec  # noqa: E402
 import focus_check  # noqa: E402
+import rig_layout  # noqa: E402
 import session_report  # noqa: E402
-from tune_exposure import prepare_for_capture, set_float, throttle  # noqa: E402
+from tune_exposure import (prepare_for_capture, set_bool, set_enum, set_float,  # noqa: E402
+                           throttle)
 
 # GenICam BayerRG8 is OpenCV's BayerBG -- the two conventions are one pixel
 # apart. session_io.py documents this; keep the two in step.
@@ -95,7 +109,16 @@ BAYER_TO_GRAY = cv.COLOR_BayerBG2GRAY
 BAYER_TO_BGR = cv.COLOR_BayerBG2BGR
 
 FACING_GOOD = 0.55
-STILL_PIXELS = 1.5          # per-corner movement between frames to count as still
+# Both cameras of a pair step must see the board at least this square. 0.45 was
+# too much for this rig on 2026-10-08: with the cameras 15-25 cm from the
+# board, turning it further towards one of them pushed it out of the other.
+PAIR_FACING = 0.35
+# Per-corner movement between two consecutive frame sets to count as still, and
+# how many consecutive still sets are needed. The cameras are fired together by
+# software trigger, so the four images of one set are taken within ~3 ms of each
+# other; what is left to guard against is motion blur within the exposure.
+STILL_PIXELS = 1.0
+STILL_SETS = 2
 MIN_CORNERS = 12
 FULL_BOARD_MARGIN = 0.6     # keep-out zone at the image border, in squares
 SHARP_PX = 3.2              # 10-90% edge width above which corners are mush
@@ -113,9 +136,9 @@ GOOD, WARN, BAD, IDLE = "#1f9d55", "#c77400", "#c0392b", "#b4b4bc"
 FIX = {
     "MEASURING": "Waiting for the first focus reading -- a few seconds.",
     "LENS": "Turn that camera's focus ring until its focus number bottoms out. "
-            "Focus on the TACTILE ARRAY, not on the background.",
-    "NO": "That camera cannot see the board. Put the board flat on the array "
-          "where all four cameras can see it.",
+            "Focus on the OBJECT PLATFORM, not on the background.",
+    "NO": "That camera cannot see the board. Put the board flat on the platform "
+          "(soft object removed) where all four cameras can see it.",
     "BOARD": "The lens is focused, but not at the board. Turn that camera's "
              "focus ring while watching the second focus number.",
     "TOO": "Press auto exposure, or open that lens's iris.",
@@ -197,63 +220,167 @@ class Step:
     # averaging can beat down noise in the origin; every other step wants
     # distinct poses and rejects repeats.
     want_distinct_poses: bool = True
+    # Steps that feed intrinsics also have to walk the board into the corners
+    # of each watched image: lens distortion is largest there, and on the
+    # 2026-09-30 session no camera ever saw the board's centre outside the
+    # middle half of its frame, so the edges were extrapolated.
+    want_coverage: bool = False
+    # Fraction of the board that must be inside every watched frame; None uses
+    # --in-frame-frac. (Pair steps briefly demanded all of it; in the confined
+    # space of this rig that let three poses through in a whole step, and the
+    # bundle adjustment uses partial views anyway.)
+    frame_frac: float | None = None
+    pair_facing: float = PAIR_FACING     # both cameras of a pair step, at least
     captured: int = 0
     signatures: list = field(default_factory=list)
+    coverage: dict = field(default_factory=dict)   # camera index -> covered cells
+
+    def coverage_short(self) -> list[int]:
+        """Watched cameras whose image is not yet covered well enough."""
+        if not self.want_coverage:
+            return []
+        cameras = list(self.pair) if self.pair else [self.target]
+        return [c for c in cameras
+                if len(self.coverage.get(c, ())) < rig_layout.COVERAGE_GOAL]
 
     @property
     def done(self) -> bool:
-        return self.captured >= self.needed
+        if self.captured < self.needed:
+            return False
+        # Coverage may be geometrically out of reach for one camera of a pair,
+        # so it extends a step by a few poses at most instead of blocking it.
+        return not self.coverage_short() or self.captured >= self.needed + 6
+
+
+WORLD_STEP_NEEDED = 12
 
 
 def build_plan(serials: list[str]) -> list[Step]:
-    total = 2 * len(serials) + 1
-    steps = [Step(
+    """Only the world step is fixed; the rest is planned from what it shows.
+
+    The world step is where every camera sees the same board lying flat, which
+    is exactly what is needed to work out where the cameras stand around it --
+    see `plan_after_world`.
+    """
+    return [Step(
         key="world",
-        title=f"Step 1 of {total}  --  world frame",
-        detail=("Lay the board FLAT on the tactile array, printed side up, then\n"
-                "LET GO. This segment defines the world origin: the same pose is\n"
-                "recorded 12x for averaging, so do not move the board at all."),
-        needed=12,
+        title="Step 1  --  world frame",
+        detail=("Take the soft object (sponge) off and lay the board FLAT on the "
+                "platform where it sat, printed side up. Then LET GO. This defines "
+                "the world origin (z = 0 is this surface); the same pose is "
+                f"recorded {WORLD_STEP_NEEDED}x for averaging, so do not touch it."),
+        needed=WORLD_STEP_NEEDED,
         want_distinct_poses=False,
     )]
-    for index, serial in enumerate(serials):
-        steps.append(Step(
-            key=f"face{index}",
-            title=f"Step {index + 2} of {total}  --  face camera {index} ({serial})",
-            detail=(f"Pick the board up and aim its printed face at {serial}." + " " +
-                    f"Turn it until that camera reads facing > {FACING_GOOD:.2f}," + " " +
-                    "then hold still." + " " +
-                    "Change the pose between shots: 30 deg left and right, 30 deg" + " " +
-                    "up and down, nearer, further."),
-            needed=8,
-            target=index,
-        ))
-    # Extrinsics live entirely in these steps: the "face" steps above point the
-    # board at one camera, which by construction hides it from the others. Every
-    # adjacent pair needs its own healthy stack of shared observations, plus a
-    # final all-cameras block that ties the whole graph together.
-    number = len(serials) + 2
-    for first in range(len(serials) - 1):
-        second = first + 1
+
+
+EXTRINSICS_SHARED = 12      # shared corners per frame when only extrinsics are solved
+EXTRINSICS_FRAME_FRAC = 0.6
+EXTRINSICS_MAX_PAIR_GAP = 70.0
+
+
+def plan_extrinsics_only(serials: list[str], azimuths: dict[int, float]) -> list[Step]:
+    """The plan when the intrinsics are reused (--intrinsics-from).
+
+    Facing and image-corner coverage exist to pin down focal length, principal
+    point and distortion. With those fixed, a frame only has to tell where the
+    cameras are relative to each other, which any shared set of corners does,
+    seen square-on or not -- so those requirements are dropped, and partial
+    boards are accepted because the bundle adjustment uses every detected
+    corner. The cameras only have to form a connected graph: one all-cameras
+    block (the board nearly flat is seen by three or four downward-looking
+    cameras at once, the easiest pose on this rig) plus the clearly adjacent
+    pairs. Wide pairs such as 1+2 (~95 deg) are left to the all-cameras block.
+    """
+    cameras = list(range(len(serials)))
+    pairs = (rig_layout.neighbour_pairs(azimuths, EXTRINSICS_MAX_PAIR_GAP)
+             if len(azimuths) == len(serials) else [])
+    total = 2 + len(pairs)
+    steps = [Step(
+        key="all",
+        title=f"Step 2 of {total}  --  all cameras together (extrinsics only)",
+        detail=("Intrinsics are reused, so only shared views count -- no facing or "
+                "corner requirements. Lay or prop the board nearly flat where three "
+                "or more cameras see it; most of the board is enough. Move it after "
+                "every shot: different places on and around the object, flat and "
+                "tilted up to ~25 deg, on the platform and a few cm up."),
+        needed=14,
+        group=cameras,
+        min_shared=EXTRINSICS_SHARED,
+        frame_frac=EXTRINSICS_FRAME_FRAC,
+    )]
+    for number, (first, second) in enumerate(pairs, start=3):
         steps.append(Step(
             key=f"pair{first}{second}",
-            title=f"Step {number + first} of {total}  --  cameras {first} + {second} together",
-            detail=(f"Hold the board between {serials[first]} and {serials[second]}," + " " +
-                    "at an angle that splits the difference, so BOTH cameras see" + " " +
-                    "the SAME part of it -- the shared-corner count is under each" + " " +
-                    "panel. Change the angle or the distance after every shot."),
-            needed=12,
+            title=(f"Step {number} of {total}  --  cameras {first} + {second} "
+                   f"({serials[first][-4:]} + {serials[second][-4:]}), extrinsics only"),
+            detail=("Any pose both cameras see most of the board in, still. Angle "
+                    "does not matter now. A few varied poses are enough; "
+                    "'skip this step' keeps what you have."),
+            needed=6,
+            pair=(first, second),
+            min_shared=EXTRINSICS_SHARED,
+            frame_frac=EXTRINSICS_FRAME_FRAC,
+            pair_facing=0.0,
+        ))
+    return steps
+
+
+def plan_after_world(serials: list[str], azimuths: dict[int, float]) -> list[Step]:
+    """Pair steps for cameras that are really next to each other, then one
+    all-cameras step.
+
+    A pair step gives both of its cameras a square-on view of the whole board
+    at once, so it feeds both intrinsics AND the link between them -- which is
+    why the separate per-camera "face" steps are gone except for a camera that
+    has no neighbour close enough to pair with.
+    """
+    cameras = list(range(len(serials)))
+    pairs = rig_layout.neighbour_pairs(azimuths) if len(azimuths) == len(serials) else []
+    solo = rig_layout.unpaired(cameras, pairs) if pairs else cameras
+    steps: list[Step] = []
+    total = 1 + len(pairs) + len(solo) + 1
+    number = 2
+    for first, second in pairs:
+        steps.append(Step(
+            key=f"pair{first}{second}",
+            title=(f"Step {number} of {total}  --  cameras {first} + {second} "
+                   f"({serials[first][-4:]} + {serials[second][-4:]})"),
+            detail=("Hold or rest the board so it faces BETWEEN these two cameras; "
+                    "it records once both see most of it and it is still. It does "
+                    "not have to sit on the platform -- anywhere both cameras see "
+                    "it works, a few cm up is often easier. Change the tilt and "
+                    "position after every shot, and reach towards the CORNERS of "
+                    "both images if you can (the cards say which is missing). If a "
+                    "pose is impossible here, 'skip this step' keeps what you have."),
+            needed=8,
             pair=(first, second),
             min_shared=SHARED_CORNERS,
+            want_coverage=True,
         ))
+        number += 1
+    for index in solo:
+        steps.append(Step(
+            key=f"face{index}",
+            title=f"Step {number} of {total}  --  face camera {index} ({serials[index]})",
+            detail=(f"No other camera stands close to {serials[index]}, so it gets its "
+                    "own step. Rest the board facing it squarely "
+                    f"(facing > {FACING_GOOD:.2f}), hands off; then move it so it "
+                    "reaches every corner of that camera's image."),
+            needed=8,
+            target=index,
+            want_coverage=True,
+        ))
+        number += 1
     steps.append(Step(
         key="all",
-        title=f"Step {number + len(serials) - 1} of {total}  --  all cameras together",
-        detail=("Put the board near the middle of the working volume and angle it" + " " +
-                "so AS MANY CAMERAS AS POSSIBLE see the same part of it at once." + " " +
-                "This step is what ties the whole camera graph together."),
-        needed=12,
-        group=list(range(len(serials))),
+        title=f"Step {number} of {total}  --  all cameras together",
+        detail=("Lay the board nearly FLAT (tilt under ~15 deg) in the space the "
+                "object will occupy, so at least three cameras see it. Move it to "
+                "a new place or height after every shot -- on the platform, then "
+                "raised a few centimetres. This ties both sides of the rig together."),
+        needed=8,
+        group=cameras,
         min_shared=SHARED_CORNERS,
     ))
     return steps
@@ -276,6 +403,7 @@ class CameraState:
     drift: float = 0.0          # how far the static scene has moved since start
     in_frame: int = 0           # board corners whose projection lands in the image
     nudge: str = ""             # which way to move the board to bring it all in
+    still: int = 0              # consecutive frame sets with the board motionless
 
 
 class Rig:
@@ -324,11 +452,57 @@ class Rig:
         self.preview_size = preview_size
         self.last_monitor = {serial: 0.0 for serial in self.serials}
 
+        self.period = 1.0 / max(fps, 0.5)
+        self.trigger_source = {}
+        self.triggered = self._arm_software_trigger()
         for _, camera in self.handles:
-            throttle(camera, fps)
+            if not self.triggered:
+                throttle(camera, fps)
             camera.BeginAcquisition()
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
+
+    def _arm_software_trigger(self) -> bool:
+        """Fire every camera from one software command, so a set is one instant.
+
+        Free-running, each camera's newest image is taken whenever its own clock
+        says, and this loop reads them one after another with a corner detection
+        in between -- so the four images of one "set" were up to a few hundred
+        milliseconds apart. A hand-held board moves in that time, and the frame
+        then describes a different board in every view. On the 2026-09-30
+        session 18 of 92 frames were inconsistent that way. Triggering all
+        cameras back to back puts their exposures within ~3 ms (measured on this
+        rig), which no hand can move a board in.
+        """
+        try:
+            for serial, camera in self.handles:
+                nodemap = camera.GetNodeMap()
+                source = PySpin.CEnumerationPtr(nodemap.GetNode("TriggerSource"))
+                if PySpin.IsReadable(source):
+                    self.trigger_source[serial] = source.GetCurrentEntry().GetSymbolic()
+                set_bool(nodemap, "AcquisitionFrameRateEnable", False)
+                ok = (set_enum(nodemap, "TriggerMode", "Off")
+                      and set_enum(nodemap, "TriggerSelector", "FrameStart")
+                      and set_enum(nodemap, "TriggerSource", "Software")
+                      and set_enum(nodemap, "TriggerMode", "On"))
+                set_enum(camera.GetTLStreamNodeMap(), "StreamBufferHandlingMode",
+                         "NewestOnly")
+                if not ok:
+                    raise PySpin.SpinnakerException("software trigger not writable")
+            return True
+        except PySpin.SpinnakerException as error:
+            print(f"software trigger unavailable ({error}); falling back to free-run, "
+                  "where the cameras of one set are NOT exposed together")
+            for _, camera in self.handles:
+                set_enum(camera.GetNodeMap(), "TriggerMode", "Off")
+            return False
+
+    def _fire(self):
+        for _, camera in self.handles:
+            try:
+                PySpin.CCommandPtr(camera.GetNodeMap().GetNode("TriggerSoftware")).Execute()
+            except PySpin.SpinnakerException:
+                pass
 
     # ------------------------------------------------------------------
     def _detect(self, serial, gray):
@@ -451,6 +625,13 @@ class Rig:
 
     def _loop(self):
         while not self.stop_event.is_set():
+            started = time.monotonic()
+            # Grab the whole set first, then process it: detection takes tens of
+            # milliseconds per image, and in free-run that delay would separate
+            # the cameras' exposures.
+            if self.triggered:
+                self._fire()
+            grabbed = []
             for serial, camera in self.handles:
                 try:
                     image = camera.GetNextImage(self.timeout_ms)
@@ -459,52 +640,69 @@ class Rig:
                 try:
                     if image.IsIncomplete():
                         continue
-                    raw = np.array(image.GetNDArray(), copy=True)
-                    stamp = time.time_ns()
+                    grabbed.append((serial, np.array(image.GetNDArray(), copy=True),
+                                    time.time_ns()))
                 finally:
                     image.Release()
+            # Publish the whole set at once. Updating camera by camera let the
+            # GUI snapshot a mix of this set and the previous one, and save it
+            # as if it were one instant (measured: 396 ms apart).
+            updates = [self._process(serial, raw, stamp) for serial, raw, stamp in grabbed]
+            with self.lock:
+                for update in updates:
+                    update()
+            if self.triggered:
+                time.sleep(max(0.0, self.period - (time.monotonic() - started)))
 
-                gray = cv.cvtColor(raw, BAYER_TO_GRAY) if raw.ndim == 2 else raw
-                corners, ids, facing, in_frame, nudge = self._detect(serial, gray)
-                self._monitor(serial, gray, corners)
+    def _process(self, serial, raw, stamp):
+        gray = cv.cvtColor(raw, BAYER_TO_GRAY) if raw.ndim == 2 else raw
+        corners, ids, facing, in_frame, nudge = self._detect(serial, gray)
+        self._monitor(serial, gray, corners)
 
-                moved = 1e9
-                earlier = self.previous[serial]
-                if corners is not None and earlier is not None:
-                    old_ids, old_corners = earlier
-                    shared = np.intersect1d(ids, old_ids)
-                    if len(shared) >= 6:
-                        a = corners[np.searchsorted(ids, shared)]
-                        b = old_corners[np.searchsorted(old_ids, shared)]
-                        moved = float(np.linalg.norm(a - b, axis=1).mean())
-                if corners is not None:
-                    order = np.argsort(ids)
-                    self.previous[serial] = (ids[order], corners[order])
-                else:
-                    self.previous[serial] = None
+        moved = 1e9
+        earlier = self.previous[serial]
+        current = None
+        if corners is not None:
+            # searchsorted needs sorted ids, and the detector does not return
+            # them in order -- comparing unsorted lists matched the wrong corners
+            # and made "still" a coin toss.
+            order = np.argsort(ids)
+            current = (ids[order], corners[order])
+        if current is not None and earlier is not None:
+            (new_ids, new_corners), (old_ids, old_corners) = current, earlier
+            shared = np.intersect1d(new_ids, old_ids)
+            if len(shared) >= 6:
+                a = new_corners[np.searchsorted(new_ids, shared)]
+                b = old_corners[np.searchsorted(old_ids, shared)]
+                moved = float(np.linalg.norm(a - b, axis=1).mean())
+        self.previous[serial] = current
 
-                preview = cv.cvtColor(raw, BAYER_TO_BGR) if raw.ndim == 2 else raw
-                preview = cv.resize(preview, self.preview_size,
-                                    interpolation=cv.INTER_AREA)
-                if corners is not None:
-                    scale = np.array([self.preview_size[0] / raw.shape[1],
-                                      self.preview_size[1] / raw.shape[0]])
-                    dot = max(2, self.preview_size[0] // 200)
-                    for point in (corners * scale).astype(int):
-                        cv.circle(preview, tuple(point), dot, (0, 255, 255), -1)
+        preview = cv.cvtColor(raw, BAYER_TO_BGR) if raw.ndim == 2 else raw
+        preview = cv.resize(preview, self.preview_size,
+                            interpolation=cv.INTER_AREA)
+        if corners is not None:
+            scale = np.array([self.preview_size[0] / raw.shape[1],
+                              self.preview_size[1] / raw.shape[0]])
+            dot = max(2, self.preview_size[0] // 200)
+            for point in (corners * scale).astype(int):
+                cv.circle(preview, tuple(point), dot, (0, 255, 255), -1)
 
-                with self.lock:
-                    state = self.state[serial]
-                    state.raw = raw
-                    state.preview = preview
-                    state.corners = corners
-                    state.ids = ids
-                    state.facing = facing
-                    state.in_frame = in_frame
-                    state.nudge = nudge
-                    state.p99 = float(np.percentile(raw, 99))
-                    state.moved = moved
-                    state.stamp_ns = stamp
+        p99 = float(np.percentile(raw, 99))
+
+        def update():               # called with self.lock held
+            state = self.state[serial]
+            state.raw = raw
+            state.preview = preview
+            state.corners = corners
+            state.ids = ids
+            state.facing = facing
+            state.in_frame = in_frame
+            state.nudge = nudge
+            state.p99 = p99
+            state.moved = moved
+            state.still = state.still + 1 if moved <= STILL_PIXELS else 0
+            state.stamp_ns = stamp
+        return update
 
     def snapshot(self) -> dict[str, CameraState]:
         with self.lock:
@@ -514,18 +712,33 @@ class Rig:
                 p99=state.p99, moved=state.moved, stamp_ns=state.stamp_ns,
                 in_frame=state.in_frame, nudge=state.nudge,
                 sharp_scene=state.sharp_scene, sharp_board=state.sharp_board,
-                drift=state.drift)
+                drift=state.drift, still=state.still)
                 for serial, state in self.state.items()}
 
-    def auto_exposure(self, target_p99: float = 205.0, max_exposure_us: float = 30000.0,
-                      max_gain_db: float = 18.0, iterations: int = 5) -> str:
+    def auto_exposure(self, target_p99: float = 205.0, max_exposure_us: float = 60000.0,
+                      max_gain_db: float = 6.0, iterations: int = 5) -> str:
         """Bring every camera to the same brightness, each with its own settings.
 
         Exposure first and gain only for the shortfall: gain is amplification,
         so it buys brightness at the price of the noise that limits sub-pixel
-        corner localisation. The live p99 the monitor already maintains is the
+        corner localisation. The board is held still and the cameras are
+        software-triggered, so a long exposure costs nothing here; gain is
+        capped at 6 dB (it used to be 18). The live p99 the monitor already maintains is the
         measurement, so this needs no extra grabs of its own.
         """
+        # The cameras' own auto exposure/gain overwrite every value written
+        # while they run -- and they come back on whenever a camera loses
+        # power (a replugged cable). On 2026-10-09 that left this loop
+        # "setting" 60 ms while the cameras sat at 15 ms and 17.9 dB.
+        for _, camera in self.handles:
+            nodemap = camera.GetNodeMap()
+            set_enum(nodemap, "ExposureAuto", "Off")
+            set_enum(nodemap, "GainAuto", "Off")
+            # Start from no gain: the loop below only ever adds gain for a
+            # shortfall exposure cannot cover, so gain left over by the camera's
+            # own auto mode would otherwise stay forever.
+            set_float(nodemap, "Gain", 0.0)
+        time.sleep(max(0.6, self.monitor_period * 0.4))   # let p99 refresh
         for _ in range(iterations):
             with self.lock:
                 measured = {s: self.state[s].p99 for s in self.serials}
@@ -567,12 +780,18 @@ class Rig:
     def close(self, trigger_hz: float = 24.2):
         self.stop_event.set()
         self.thread.join(timeout=3.0)
-        for _, camera in self.handles:
+        for serial, camera in self.handles:
             try:
                 camera.EndAcquisition()
             except PySpin.SpinnakerException:
                 pass
             try:
+                # Trigger mode off before the source can be written back; the
+                # capture script sets its own source, but leave things as found.
+                set_enum(camera.GetNodeMap(), "TriggerMode", "Off")
+                if serial in self.trigger_source:
+                    set_enum(camera.GetNodeMap(), "TriggerSource",
+                             self.trigger_source[serial])
                 prepare_for_capture(camera, trigger_hz)
             except PySpin.SpinnakerException:
                 pass
@@ -620,7 +839,7 @@ class SessionWriter:
         self.index += 1
         return index
 
-    def finish(self, steps: list[Step]) -> Path:
+    def finish(self, steps: list[Step], extra: dict | None = None) -> Path:
         fields = ["host_received_ns", "capture_sequence_index", "camera_frame_id",
                   "camera_timestamp", "complete", "image_status", "image_path"]
         for position, serial in enumerate(self.serials):
@@ -637,7 +856,8 @@ class SessionWriter:
             "image_format": "bmp",
             "color_requested": True,
             "demosaic_on_save": False,
-            "trigger_source": "none (guided free-run, board verified stationary)",
+            "trigger_source": (extra or {}).get(
+                "trigger_source", "none (guided free-run, board verified stationary)"),
             "camera_stats": [{"camera_index": i, "serial": s,
                               "source_pixel_format": "BayerRG8",
                               "saved_pixel_format": "BayerRG8"}
@@ -647,6 +867,7 @@ class SessionWriter:
             "world_frames": [0, world[0].captured if world else 0],
             "steps": [{"key": s.key, "captured": s.captured, "needed": s.needed}
                       for s in steps],
+            "layout": (extra or {}).get("layout", {}),
         }, indent=2), encoding="utf-8")
         return self.root
 
@@ -668,6 +889,8 @@ class App:
         self.saved_path = None
         self.message = ""
         self.message_until = 0.0
+        self.world_views = {}       # camera index -> (ids, corners, size) of the world pose
+        self.layout = {}            # what plan_after_world was given, for session.json
 
         self.ui = ui_scale(root)
         f = self.ui["font"]
@@ -771,6 +994,11 @@ class App:
         # window ends up taller than the screen.
         self.tick()
         self.fit_to_screen()
+        if getattr(args, "auto_exposure", True):
+            # Balance exposure once the cameras have delivered a few frames, so
+            # every session starts from the lighting actually in the room
+            # rather than from whatever the last tool left in the cameras.
+            self.root.after(2500, self.startup_exposure)
 
     def fit_to_screen(self):
         """Shrink the previews until the whole window fits the display.
@@ -818,7 +1046,10 @@ class App:
         self.message_until = time.monotonic() + seconds
 
     def skip(self):
-        if self.step() is not None:
+        step = self.step()
+        if step is not None:
+            if step.key == "world":
+                self.plan_rest()
             self.current += 1
             self.notify("step skipped")
 
@@ -827,7 +1058,11 @@ class App:
 
     def finish(self):
         self.running = False
-        self.saved_path = self.writer.finish(self.steps)
+        self.saved_path = self.writer.finish(self.steps, {
+            "trigger_source": ("software (all cameras fired together)"
+                               if self.rig.triggered else
+                               "none (guided free-run, board verified stationary)"),
+            "layout": self.layout})
         self.rig.close(self.args.trigger_hz)
         print()
         print(f"saved {self.writer.index} frame sets to {self.saved_path}")
@@ -865,6 +1100,9 @@ class App:
             if step.target is not None and state.facing < FACING_GOOD:
                 return (f"{serial} reads facing {state.facing:.2f}; turn the board to "
                         f"square up with it (needs > {FACING_GOOD:.2f})")
+            if step.pair is not None and state.facing < step.pair_facing:
+                return (f"{serial} reads facing {state.facing:.2f}; turn the board "
+                        f"towards it (both cameras need > {step.pair_facing:.2f})")
 
         # Extrinsics come only from corners that two cameras BOTH measured. It is
         # not enough for each to see "the board" -- with a target larger than the
@@ -880,7 +1118,8 @@ class App:
             # upright, so demanding every corner can leave too few reachable poses.
             # What the solve needs is a large SHARED region, and calibrate.py
             # --common-corners already solves on one -- so this is a knob, not a law.
-            need = int(round(self.args.in_frame_frac * total))
+            frac = step.frame_frac if step.frame_frac is not None else self.args.in_frame_frac
+            need = int(round(frac * total))
             for serial in watched:
                 state = snapshot[serial]
                 if state.in_frame < need:
@@ -899,19 +1138,90 @@ class App:
                         f">= {step.min_shared}) -- angle the board so both see the "
                         f"same part of it")
 
-        for state in seen:
-            if state.moved > STILL_PIXELS:
-                return "board still moving -- hold it steady for a second"
+        # Only the cameras this step needs: a camera catching a flickering edge
+        # of the board never accumulates still sets and would block the step,
+        # and with every camera fired together its image is of the same
+        # instant anyway.
+        for serial in watched:
+            if snapshot[serial].still < STILL_SETS:
+                return ("board still moving -- rest it on something and take your "
+                        "hands off")
 
         if step.want_distinct_poses:
             state = snapshot[watched[0]]
             centre = state.corners.mean(axis=0)
             signature = np.array([centre[0], centre[1], state.facing * 600.0])
-            for previous in step.signatures:
-                if np.linalg.norm(signature - previous) < self.args.novelty:
-                    return "this pose is already recorded -- change the angle or the distance"
+            gains = self.coverage_gain(step, snapshot)
+            if step.captured >= step.needed and step.coverage_short() and not gains:
+                return ("enough poses here -- move the board towards the "
+                        + self.coverage_hint(step))
+            if not gains:
+                for previous in step.signatures:
+                    if np.linalg.norm(signature - previous) < self.args.novelty:
+                        return ("this pose is already recorded -- change the angle "
+                                "or the distance")
             step.signatures.append(signature)
         return None
+
+    def coverage_gain(self, step: Step, snapshot) -> bool:
+        """Would recording this pose reach a part of a watched image not yet covered?"""
+        if not step.want_coverage:
+            return False
+        for index in (step.pair or (step.target,)):
+            state = snapshot[self.rig.serials[index]]
+            if state.corners is None or state.raw is None:
+                continue
+            height, width = state.raw.shape[:2]
+            cells = rig_layout.coverage_cells(state.corners, width, height)
+            if cells - step.coverage.get(index, set()):
+                return True
+        return False
+
+    def record_coverage(self, step: Step, snapshot):
+        if not step.want_coverage:
+            return
+        for index in (step.pair or (step.target,)):
+            state = snapshot[self.rig.serials[index]]
+            if state.corners is None or state.raw is None:
+                continue
+            height, width = state.raw.shape[:2]
+            step.coverage.setdefault(index, set()).update(
+                rig_layout.coverage_cells(state.corners, width, height))
+
+    def coverage_hint(self, step: Step) -> str:
+        short = step.coverage_short()
+        if not short:
+            return "anywhere new"
+        index = short[0]
+        missing = rig_layout.missing_cells(step.coverage.get(index, set()))
+        return (f"{missing[0].upper()} of camera {index}'s image"
+                if missing else "anywhere new")
+
+    def plan_rest(self):
+        """Work out where the cameras stand from the world pose, then plan."""
+        azimuths = {}
+        for index, serial in enumerate(self.rig.serials):
+            view = self.world_views.get(index)
+            if view is None:
+                continue
+            ids, corners, size = view
+            K, dist = self.args.prior_intrinsics.get(
+                serial, (rig_layout.nominal_K(*size), None))
+            azimuth = rig_layout.camera_azimuth(
+                self.rig.object_points.astype(np.float64), ids, corners, K, dist)
+            if azimuth is not None:
+                azimuths[index] = azimuth
+        if self.args.intrinsics_from:
+            rest = plan_extrinsics_only(self.rig.serials, azimuths)
+        else:
+            rest = plan_after_world(self.rig.serials, azimuths)
+        self.steps.extend(rest)
+        self.layout = {"azimuth_deg": {str(k): round(v, 1) for k, v in azimuths.items()},
+                       "steps": [step.key for step in rest]}
+        ring = ", ".join(f"cam{k} {v:.0f}" for k, v in
+                         sorted(azimuths.items(), key=lambda item: item[1]))
+        print(f"camera azimuths around the board (deg): {ring}")
+        print("plan: " + " -> ".join(step.key for step in self.steps))
 
     def shared_with_watched(self, serial, snapshot, step) -> str:
         """How many corners this camera shares with the others this step needs.
@@ -990,6 +1300,16 @@ class App:
         self.capture_bar.pack(fill="x", padx=12, pady=8)
         self.notify("recording -- follow the step above", 3.0)
 
+    def startup_exposure(self):
+        if not self.running or self.phase != "preflight":
+            return
+        if not any(state.p99 > 0 for state in self.rig.snapshot().values()):
+            self.root.after(1000, self.startup_exposure)    # no frame yet
+            return
+        print("auto exposure at start-up (skip with --no-auto-exposure)", flush=True)
+        self.auto_exposure()
+        print(self.message, flush=True)
+
     def auto_exposure(self):
         self.notify("balancing exposure...", 6.0)
         self.root.update_idletasks()
@@ -1024,10 +1344,18 @@ class App:
         focus = ("--" if state.sharp_scene <= 0 else
                  f"{state.sharp_scene:.2f}"
                  + (f"/{state.sharp_board:.2f}" if state.sharp_board > 0 else ""))
+        cover = ""
+        index = self.rig.serials.index(serial)
+        if step is not None and step.want_coverage and index in (step.pair or (step.target,)):
+            covered = step.coverage.get(index, set())
+            missing = rig_layout.missing_cells(covered)
+            cover = (f"   cover {len(covered)}/9"
+                     + (f" -> {missing[0]}" if missing and
+                        len(covered) < rig_layout.COVERAGE_GOAL else " ok"))
         return chr(10).join([
             f"facing {state.facing:4.2f}  corners {count:3d}{shared}  "
-            + ("still" if state.moved <= STILL_PIXELS else "MOVING"),
-            framing,
+            + ("still" if state.still >= STILL_SETS else "MOVING"),
+            framing + cover,
             f"focus {focus}  drift {state.drift:.1f}px  p99 {state.p99:3.0f} {bright}",
         ])
 
@@ -1037,8 +1365,8 @@ class App:
         self.title_var.set("Pre-flight  --  check the rig before spending half an hour")
         self.bar.configure(maximum=100)
         self.detail_var.set(
-            "Put the board FLAT on the tactile array so every camera can see it, "
-            "then leave the rig alone." + chr(10) +
+            "Take the soft object off and put the board FLAT on the platform so every "
+            "camera can see it, then leave the rig alone." + chr(10) +
             "Focus is judged on the 10-90% edge width: under "
             f"{SHARP_PX:g} px the corner refiner sees an edge, above it a ramp." + chr(10) +
             "Drift is how far the static scene has moved since this window opened "
@@ -1103,12 +1431,16 @@ class App:
                     colour = GOOD if ok else WARN
                     tag = "SQUARE ON" if ok else f"TURN TOWARDS ME ({state.facing:.2f})"
                 elif in_pair or in_group:
-                    need = self.args.in_frame_frac * len(self.rig.object_points)
+                    frac = (step.frame_frac if step.frame_frac is not None
+                            else self.args.in_frame_frac)
+                    need = frac * len(self.rig.object_points)
                     ok = state.corners is not None and state.in_frame >= need
                     colour = GOOD if ok else WARN
                     tag = "IN VIEW" if ok else (
                         "BOARD NOT SEEN" if state.corners is None
                         else f"MOVE {state.nudge.upper() or 'TO CENTRE'}")
+                    if ok and in_pair and state.facing < step.pair_facing:
+                        colour, tag = WARN, f"TURN TOWARDS ME ({state.facing:.2f})"
             self.set_card(serial, state, colour, f"{serial}   {tag}",
                           self.readouts(state, snapshot, step, serial))
 
@@ -1150,8 +1482,17 @@ class App:
             if reason is None:
                 index = self.writer.save_set(snapshot)
                 step.captured += 1
+                self.record_coverage(step, snapshot)
+                if step.key == "world":
+                    self.world_views = {
+                        i: (snapshot[s].ids, snapshot[s].corners,
+                            snapshot[s].raw.shape[1::-1])
+                        for i, s in enumerate(self.rig.serials)
+                        if snapshot[s].corners is not None and snapshot[s].raw is not None}
                 self.notify(f"recorded set {step.captured} (frame {index})", 1.2)
                 if step.done:
+                    if step.key == "world":
+                        self.plan_rest()
                     self.current += 1
                     self.notify("step complete -- read the next instruction above", 2.5)
             elif time.monotonic() > self.message_until:
@@ -1166,7 +1507,8 @@ def main() -> int:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--board", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--fps", type=float, default=6.0)
+    parser.add_argument("--fps", type=float, default=6.0,
+                        help="frame sets per second (the cameras are fired together)")
     parser.add_argument("--interval-ms", type=int, default=120)
     parser.add_argument("--timeout-ms", type=int, default=2000)
     parser.add_argument("--novelty", type=float, default=90.0,
@@ -1176,17 +1518,42 @@ def main() -> int:
                         help="print the accept/reject decision every tick")
     parser.add_argument("--in-frame-frac", type=float, default=0.85,
                         help="fraction of the board that must be inside the frame "
-                             "before a pair/group set is recorded. 1.0 is what the "
-                             "strict solve wants; below that the solve falls back "
-                             "to --common-corners on the shared sub-pattern")
+                             "before an all-cameras set is recorded. Pair steps "
+                             "always demand the whole board, which is what the "
+                             "strict solve uses")
     parser.add_argument("--no-solve", action="store_true",
                         help="just save; skip the solve and the quality verdict")
     parser.add_argument("--calib-python", type=Path, default=None,
                         help="interpreter of the calibration venv; found "
                              "automatically at <repo>/.venv-calib")
+    parser.add_argument("--no-auto-exposure", dest="auto_exposure", action="store_false",
+                        help="keep the cameras' current exposure instead of balancing it "
+                             "automatically when the window opens")
+    parser.add_argument("--prior-calibration", type=Path,
+                        default=Path(__file__).resolve().parent / "calibration.json",
+                        help="an earlier calibration.json; its intrinsics only help "
+                             "work out where the cameras stand, so an outdated one "
+                             "is fine and a missing one falls back to a nominal lens")
+    parser.add_argument("--intrinsics-from", type=Path, default=None,
+                        help="solve with the K and distortion of an earlier "
+                             "calibration.json instead of fitting them. Valid while "
+                             "no lens has been refocused or had its iris touched; the "
+                             "session then only has to locate the cameras, which "
+                             "needs far fewer poses (calibrate.py checks the fit)")
+    parser.add_argument("--world-z-offset", type=float, default=None, metavar="MM",
+                        help="passed to calibrate.py: put z = 0 on the platform, not "
+                             "on the printed face, e.g. -1.2 for the board on its glass")
     parser.add_argument("--autoclose", type=float, default=0.0,
                         help="close and save after N seconds; for smoke-testing only")
     args = parser.parse_args()
+
+    args.prior_intrinsics = {}
+    if args.prior_calibration and args.prior_calibration.exists():
+        prior = json.loads(args.prior_calibration.read_text(encoding="utf-8"))
+        for camera in prior.get("cameras", []):
+            args.prior_intrinsics[camera["serial"]] = (
+                np.asarray(camera["K"], np.float64),
+                np.asarray(camera["dist"], np.float64))
 
     spec = BoardSpec.load(args.board)
     dictionary = cv.aruco.getPredefinedDictionary(getattr(cv.aruco, spec.dictionary))
@@ -1227,9 +1594,14 @@ def main() -> int:
         print(f"\nnot graded (--no-solve). Session: {app.saved_path}")
         return 0
     calib_python = session_report.find_calib_python(args.calib_python)
+    extra = []
+    if args.intrinsics_from:
+        extra += ["--intrinsics-from", str(args.intrinsics_from.resolve())]
+    if args.world_z_offset is not None:
+        extra += ["--world-z-offset", str(args.world_z_offset)]
     return session_report.report(
         app.saved_path, args.board.resolve(), calib_python,
-        [(s.key, s.captured, s.needed) for s in app.steps])
+        [(s.key, s.captured, s.needed) for s in app.steps], extra)
 
 
 if __name__ == "__main__":

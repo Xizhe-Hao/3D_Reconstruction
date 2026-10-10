@@ -109,6 +109,10 @@ are green or red, `START CALIBRATION` is disabled until they are all green, and
 the capture, so by the end it covers the whole half hour.
 
 
+Exposure: the pre-flight `auto exposure` button now allows up to 60 ms and at
+most 6 dB of gain (it was 30 ms / 18 dB) -- the board is still, so a long
+exposure is free and gain is noise.
+
 When you press **finish and save** it writes the session, then grades it without
 being asked: how far each camera drifted during the run, followed by the full
 solve (`detect_corners` -> `calibrate` -> `validate`) run under the calibration
@@ -130,13 +134,29 @@ stricter condition. The output is an ordinary session directory, ~1 GB instead
 of 27 GB because only good poses reach disk, and `session.json` records the
 world-segment range to pass to `--world-frames`.
 
-The steps it enforces, in order:
+The steps it enforces, in order. Only the first is fixed; the rest are planned
+from it (`rig_layout.py`):
 
 | Step | What it wants |
 |---|---|
-| world | Board flat and still on the tactile array. Same pose recorded 12x for averaging. |
-| face 0..N | Board held so it FACES each camera in turn (`facing > 0.55`), 8 distinct poses each. |
-| pairs | Board shared between adjacent cameras, 6 poses each. |
+| world | Soft object off, board flat and still on the platform. Same pose recorded 12x for averaging. Every camera sees it, so this is also where the window measures **where each camera stands** around the board. |
+| pair *a*+*b* | One per pair of cameras that are really neighbours (< 100 deg apart around the board). Both see most of the board (`--in-frame-frac`, 0.85) with `facing > 0.35`, and the board is walked towards the corners of both images (`cover n/9` on the card). 8 poses, up to 6 more while an image corner is still uncovered. `skip this step` keeps what was recorded. |
+| face *n* | Only for a camera with no neighbour close enough to pair with. |
+| all | Board nearly flat in the object's space, seen by >= 3 cameras, at several places and heights. 8 poses. |
+
+On this rig that is world -> 0+2 -> 1+2 -> 1+3 -> all: 5 steps instead of 9.
+The old plan paired cameras by **number** (0+1, 1+2, 2+3), but cameras 0 and 1
+face each other across the array, as do 2 and 3. No flat board faces both of
+two opposite cameras, which is why the 2026-09-30 session had to fall back to an
+80-corner sub-pattern.
+
+**Rest the board, do not hold it.** Bring something to prop it on (a box, a
+book, a phone stand). A set is recorded only after two consecutive frame sets
+in which no camera saw the board move by more than 1 px. The cameras are fired
+together by software trigger, so the four images of a set are exposed within
+~3 ms of each other; free-running they were up to a few hundred milliseconds
+apart, and on the 2026-09-30 session 18 of 92 hand-held frames described a
+board that had moved between cameras.
 
 **The whole board must be inside the frame, not merely detected.** The strict
 multi-view solve uses only frames in which a camera measured *every* corner, so a
@@ -217,6 +237,33 @@ python calibration\calibrate.py calib\detections.npz --out calib\calibration.jso
 
 python calibration\validate.py calib\calibration.json calib\detections.npz --plots calib\report
 ```
+
+`detect_corners.py` no longer adds its own `cornerSubPix` pass by default
+(`--subpix-win 0`). The ChArUco detector already refines its corners, and the
+extra pass made them worse: on the 2026-09-30 world frames, where the board lay
+still and frame-to-frame jitter was only 0.04-0.08 px, the single-view residual
+per camera was 0.47/0.68/0.81/0.69 px with the old `auto` and
+0.41/0.46/0.39/0.57 px without it.
+
+`calibrate.py` holds out frames from the **moving** steps only, and keeps them
+out of the intrinsics and the bundle adjustment too. It used to hold out the
+first block of the session -- the world segment, i.e. one static pose -- and
+the bundle adjustment saw the held-out frames anyway, so validate.py graded the
+fit partly on data it had been fitted to. The bundle adjustment also drops
+frames where the cameras disagree by more than max(3x the median frame error,
+1.5 px) and solves again; `bundle_refinement.frames_rejected` lists them.
+
+Re-solving the 2026-09-30 session with these changes, graded the honest way:
+
+| | before | after |
+|---|---|---|
+| held-out re-projection RMS | 0.72 px (WARN) | 0.48 px (PASS) |
+| worst pair epipolar RMS | 1.10 px (WARN) | 0.76 px (PASS) |
+| inter-corner distance error P95 | 0.220 mm | 0.199 mm |
+| worst per-camera intrinsics RMS | 0.93 px | 0.79 px |
+
+The 0.17 mm reported for that calibration was measured on the world pose alone;
+0.22 mm is what it is worth on moving held-out frames.
 
 `detect_corners.py` prints a co-visibility matrix: the number of frames in which
 each **pair** of cameras sees the complete board. Thin entries there are the
@@ -373,11 +420,14 @@ python calibration\tests\run_selftest.py --work-dir <scratch>\calib_selftest
 
 Renders a synthetic four-camera rig with known intrinsics, extrinsics, lens
 distortion and Bayer mosaic, runs the real scripts on it, and checks the
-recovered parameters against the values used to render. Currently 46/46 checks:
+recovered parameters against the values used to render. Currently 92/92 checks:
 focal length within 0.25%, orientation within 0.14°, camera position within
 0.9 mm at 420 mm range, and a held-out metric error of 0.09 mm. It covers both
-corner-selection modes, the world-frame flip, and the GenICam/OpenCV Bayer
-naming. Run it after changing anything here. `--cameras 3` exercises a
+corner-selection modes, the world-frame flip, the GenICam/OpenCV Bayer
+naming, the capture planner (camera azimuths from one uncalibrated world view,
+neighbour pairs, and the real rig's layout), and the rejection of frames in
+which one camera's view was shifted as if the board had moved between
+exposures. Run it after changing anything here. `--cameras 3` exercises a
 three-camera rig (36/36 checks).
 
 ## What actually goes wrong on this rig

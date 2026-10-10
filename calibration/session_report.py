@@ -41,7 +41,7 @@ DRIFT_SOLID, DRIFT_BAD = 1.0, 3.0
 
 
 # --------------------------------------------------------------- rig stability
-def measure_drift(session_dir: Path, bayer: str = "RG") -> dict[str, float | None]:
+def measure_drift(session_dir: Path, bayer: str = "BG") -> dict[str, float | None]:
     """Per-camera displacement of the STATIC scene, first saved frame to last.
 
     The board is masked out of both frames: it is the most feature-dense thing
@@ -139,6 +139,7 @@ def _run(argv, label, quiet=False):
         print(f"  {label:<16} ", end="", flush=True)
     done = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8",
                           errors="replace")
+    _run.last = done
     # validate.py exits non-zero when a check FAILs, which is a result, not a
     # crash -- its output is exactly what we came for.
     ok = done.returncode == 0 or label == "validate"
@@ -170,19 +171,24 @@ def solve_and_grade(session: Path, board: Path, calib_python: Path,
         # board. When too few exist, calibrate.py says so and names the escape
         # hatch; take it rather than reporting nothing, but say that we did --
         # a sub-pattern gives a weaker per-frame pose than the full board.
-        print("  calibrate        retrying on the shared sub-pattern "
-              "(--common-corners 40)")
-        if _run(base + ["--common-corners", "40"], "calibrate", quiet=True) is None:
+        for corners in ("40", "20"):
+            print(f"  calibrate        retrying on the shared sub-pattern "
+                  f"(--common-corners {corners})")
+            if _run(base + ["--common-corners", corners], "calibrate", quiet=True) is not None:
+                print("  calibrate        done (sub-pattern; the bundle adjustment then "
+                      "uses every detected corner)")
+                break
+        else:
             print("  calibrate        FAILED even on the sub-pattern")
             return None
-        print("  calibrate        done (sub-pattern -- expect weaker extrinsics)")
     return _run([str(calib_python), str(here / "validate.py"), str(calibration),
                  str(detections), "--report", str(session / "metrics.json")], "validate")
 
 
 # ---------------------------------------------------------------------- report
 def report(session: Path, board: Path, calib_python: Path | None,
-           steps: list[tuple[str, int, int]]) -> int:
+           steps: list[tuple[str, int, int]],
+           extra_calibrate: list[str] | None = None) -> int:
     """Print the whole verdict. Returns a process exit code."""
     bar = "=" * 72
     print()
@@ -217,7 +223,8 @@ def report(session: Path, board: Path, calib_python: Path | None,
         meta = json.loads((session / "session.json").read_text(encoding="utf-8"))
         low, high = meta.get("world_frames", [0, 0])
         print(f"\nsolving (this takes a few minutes) -- world frames {low}:{high}")
-        out = solve_and_grade(session, board, calib_python, f"{low}:{high}")
+        out = solve_and_grade(session, board, calib_python, f"{low}:{high}",
+                              extra_calibrate)
         if out:
             print("\ncalibration quality")
             for line in out.splitlines():
@@ -249,8 +256,17 @@ def report(session: Path, board: Path, calib_python: Path | None,
         print("Usable, but secure the mounts before the numbers stop being lucky.")
         code = 0
     elif calib_python is None or not verdict_lines:
-        print("VERDICT: not graded -- the solve did not complete. Run detect_corners /")
-        print("calibrate / validate by hand to see why.")
+        print("VERDICT: not graded -- the solve did not complete.")
+        last = getattr(_run, "last", None)
+        reason = [] if last is None else (
+            (last.stderr or "").strip().splitlines()[-3:]
+            + (last.stdout or "").strip().splitlines()[-2:])
+        for line in reason:
+            print(f"  {line}")
+        distinct = sum(c for k, c, _ in steps if k != "world")
+        if distinct < 30:
+            print(f"Only {distinct} moving poses were recorded (plus the static world "
+                  "pose); a solve needs roughly 30 or more, spread over the steps.")
         code = 1
     elif failures:
         print(f"VERDICT: NOT USABLE -- {failures} check(s) failed"

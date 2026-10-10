@@ -93,13 +93,54 @@ def seed_board_poses(corners, object_points, Ks, dists, Rs, Ts):
 
 
 def refine(corners, object_points, Ks, dists, Rs, Ts, max_iterations=60,
-           verbose=True):
-    """Joint LM over every detected corner. Returns refined (Rs, Ts, stats)."""
+           verbose=True, reject_frames=True):
+    """Joint LM over every detected corner. Returns refined (Rs, Ts, stats).
+
+    With `reject_frames`, the solve runs twice. Frames in which the cameras
+    disagree about where the board was are dropped before the second pass.
+    The guided capture runs the cameras free (no common trigger), so each
+    camera's image of a hand-held board is taken up to one frame period apart;
+    a board that drifted in between is a different board in each view, and no
+    extrinsics fit it. On the 2026-09-30 session those frames were a tenth of
+    the total and set the 90th-percentile frame error at 6.5 px against a
+    median of 1.3 px.
+    """
+    Rs_out, Ts_out, stats = _refine_once(corners, object_points, Ks, dists, Rs, Ts,
+                                         max_iterations, verbose, None)
+    if not reject_frames:
+        return Rs_out, Ts_out, stats
+    frame_rms = stats.pop("_frame_rms")
+    values = np.array(list(frame_rms.values()))
+    if values.size < 10:
+        return Rs_out, Ts_out, stats
+    # A frame is inconsistent when it is far outside what the rest of the
+    # session achieves; the floor keeps a clean session from losing frames to
+    # ordinary scatter.
+    limit = max(3.0 * float(np.median(values)), 1.5)
+    drop = sorted(f for f, v in frame_rms.items() if v > limit)
+    if not drop or len(drop) > 0.4 * values.size:
+        stats["frames_rejected"] = []
+        return Rs_out, Ts_out, stats
+    if verbose:
+        print(f"   {len(drop)} frame(s) where the cameras disagree by > {limit:.2f} px "
+              "(board moved between exposures) -- dropped and re-solved")
+    Rs_out, Ts_out, stats = _refine_once(corners, object_points, Ks, dists, Rs_out,
+                                         Ts_out, max_iterations, verbose, set(drop))
+    stats.pop("_frame_rms")
+    stats["frames_rejected"] = drop
+    stats["frame_rejection_limit_px"] = limit
+    return Rs_out, Ts_out, stats
+
+
+def _refine_once(corners, object_points, Ks, dists, Rs, Ts, max_iterations, verbose,
+                 excluded):
     num_cams, num_frames = corners.shape[0], corners.shape[1]
     Ks = [np.asarray(K, np.float64) for K in Ks]
     dists = [np.asarray(d, np.float64).reshape(1, -1) for d in dists]
 
     board_poses, valid = seed_board_poses(corners, object_points, Ks, dists, Rs, Ts)
+    if excluded:
+        valid[sorted(excluded)] = False
     frames = np.flatnonzero(valid)
     frame_slot = {int(f): i for i, f in enumerate(frames)}
 
@@ -165,5 +206,19 @@ def refine(corners, object_points, Ks, dists, Rs, Ts, max_iterations=60,
         Ts_out.append(t)
     if verbose:
         print(f"   reprojection rms over ALL corners: {before:.4f} -> {after:.4f} px")
+
+    # Per-frame RMS, counted only for frames that more than one camera saw:
+    # a frame with a single view fits its own board pose exactly and says
+    # nothing about whether the cameras agree.
+    squared, views = {}, {}
+    at = 0
+    for ci, fi, seen in obs:
+        block = result.fun[at:at + 2 * len(seen)]
+        squared.setdefault(fi, []).append(block)
+        views[fi] = views.get(fi, 0) + 1
+        at += 2 * len(seen)
+    frame_rms = {fi: float(np.sqrt(np.mean(np.concatenate(blocks) ** 2)))
+                 for fi, blocks in squared.items() if views[fi] >= 2}
     return Rs_out, Ts_out, {"observations": total, "rms_before": before,
-                            "rms_after": after, "frames": len(frames)}
+                            "rms_after": after, "frames": len(frames),
+                            "_frame_rms": frame_rms}

@@ -277,3 +277,33 @@ conda run --no-capture-output -n mvtracker \
 `--result-dir` 可以传运行结果目录，也可以直接传其中的 `da3/` 或 `duster/`。
 原来的 `--duster-dir` 参数仍然可用。页面显示与 MVTracker 实际使用一致的
 过滤后深度；RGB 从 DA3 输入缓存读取，与深度逐帧对齐。
+
+## 重建精度评估
+
+`scripts/eval_accuracy.py` 用已知答案检查一次重建（任何深度后端都适用），读取
+`run_test_session.py` 的输出目录、会话的 `calibration.json`、
+`multimodal_video_alignment.csv`，以及（只在标定板测试中）原始视频。时间段单位为
+视频秒，与 `--start/--end` 相同，必须落在已重建的片段内。所有结果单位为毫米。
+
+| 测试 | 采集内容 | 真值 | 输出 |
+| --- | --- | --- | --- |
+| `--static A:B` | 物体静止不动 | 深度不应随时间变化 | 每台相机逐像素深度的时间标准差（噪声下限） |
+| `--plane A:B` | 拿掉软物体后的空台面 | 标定定义的 z = 0 | 台面重建高度、平整度、相机间高度差（需用 `--box` 只框住台面） |
+| `--board A:B` | 标定板静止放在工作区 | 角点由标定三角化（约 0.16 mm，与深度网络无关） | 每台相机在角点处的有符号深度误差及相对误差 |
+| `--press A:B` | Mark-10 分步压入并保持 | 接触后的横梁行程 `force_distance` | 压头边缘一圈（`--ring`）表面下降量与行程之比（斜率）及误差 |
+
+```bash
+conda run --no-capture-output -n mvtracker python scripts/eval_accuracy.py \
+  --run-dir outputs/<name>/seconds_<a>_<b>_target_<N>_da3 \
+  --static 0:2.5 --board 3:6 --press 8:30 --ring 5,9 \
+  --report outputs/<name>/accuracy_da3.json
+```
+
+- `--press` 默认自动定位压头轴线（峰值载荷时表面下降最多区域的中心），也可用
+  `--press-xy X,Y` 指定。`--ring` 的内半径取压头半径略大一点；平头压头边缘的表面随
+  压头移动，所以斜率应接近 1，明显小于 1 说明重建把凹陷抹平了。
+- Mark-10 距离单位若为英寸，加 `--distance-unit in`。
+- 对比不同深度后端时，对同一段采集分别运行 `run_test_session.py --depth-backend
+  da3/foundationstereo/duster`，再对各自的输出目录运行本脚本。
+- `python scripts/eval_accuracy.py --selftest` 在合成数据上植入已知误差（每台相机深度
+  偏差、噪声、已知深度的凹陷），检查脚本能否准确测出。

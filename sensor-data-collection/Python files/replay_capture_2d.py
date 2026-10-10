@@ -130,7 +130,11 @@ def parse_args():
         help="Use the fixed default scale instead of sizing it to the data.",
     )
     parser.add_argument("--gain", type=float, default=1.0)
-    parser.add_argument("--invert", action="store_true")
+    parser.add_argument("--invert", action="store_true",
+                        help="flip the sign of the change; needed for a sensor whose "
+                             "ADC reading RISES under load (the 2026-10 array)")
+    parser.add_argument("--no-d455", action="store_true",
+                        help="hide the D455 colour/depth previews even if exported")
     parser.add_argument("--filter-alpha", type=float, default=1.0)
     parser.add_argument("--preview-width", type=int, default=480)
     parser.add_argument("--start-frame", type=int, default=0)
@@ -307,11 +311,46 @@ class Replay2D(MultimodalReplay):
                 session["cameras"]["video_info"],
             )
         ]
+        self.preview_names = [
+            f"[{index}] {name}" for index, name in enumerate(session["cameras"]["names"])
+        ]
+        if not getattr(args, "no_d455", False):
+            self._add_d455_previews(session)
         self._build_figure()
         self.show_frame(self.current_frame, force=True)
 
+    def _add_d455_previews(self, session):
+        """The D455 colour and depth-preview videos, if export_multimodal_mp4
+        wrote them: frame k of each is the D455 frame matched to frame k of
+        the Blackfly videos, so they play in step with no extra bookkeeping."""
+        import json
+
+        import cv2
+
+        export = Path(session["session_dir"]) / "multimodal_video_export.json"
+        if not export.is_file():
+            return
+        info = json.loads(export.read_text(encoding="utf-8")).get("d455") or {}
+        for key, label in (("color_video", "D455 colour"),
+                           ("depth_preview_video", "D455 depth")):
+            name = info.get(key)
+            path = Path(session["session_dir"]) / name if name else None
+            if path is None or not path.is_file():
+                continue
+            capture = cv2.VideoCapture(str(path))
+            width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            capture.release()
+            self.video_readers.append(VideoFrameReader(
+                path, session["cameras"]["video_fps"], width, height,
+                self.args.preview_width))
+            if key == "depth_preview_video" and info.get("depth_preview_range_m"):
+                low, high = info["depth_preview_range_m"]
+                label += f" ({low:.2f}-{high:.2f} m)"
+            self.preview_names.append(label)
+
     def _build_figure(self):
-        preview_rows, preview_columns = camera_grid_shape(self.camera_count)
+        preview_rows, preview_columns = camera_grid_shape(len(self.video_readers))
         figure_height = 10.0 + 2.6 * (preview_rows - 1)
         preview_share = 0.72 + 0.62 * (preview_rows - 1)
         self.fig = plt.figure(figsize=(17, figure_height))
@@ -333,16 +372,12 @@ class Replay2D(MultimodalReplay):
             wspace=0.06,
         )
         self.image_artists = []
-        for camera_index in range(self.camera_count):
+        for camera_index in range(len(self.video_readers)):
             row, column = divmod(camera_index, preview_columns)
             axis = self.fig.add_subplot(preview_grid[row, column])
             preview = self.video_readers[camera_index].read(self.current_frame)
             artist = axis.imshow(preview, interpolation="nearest")
-            axis.set_title(
-                f"[{camera_index}] "
-                f"{self.session['cameras']['names'][camera_index]}",
-                fontsize=9,
-            )
+            axis.set_title(self.preview_names[camera_index], fontsize=9)
             axis.set_axis_off()
             self.image_artists.append(artist)
 

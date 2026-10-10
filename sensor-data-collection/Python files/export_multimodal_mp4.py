@@ -31,7 +31,16 @@ BAYER_FFMPEG_FORMATS = {
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("session", type=Path)
-    parser.add_argument("--fps", type=float, default=24.0)
+    parser.add_argument(
+        "--fps",
+        type=float,
+        default=None,
+        help=(
+            "Video frame rate. Default: measured from the capture timestamps, "
+            "so that video seconds stay real seconds whatever rate the Arduino "
+            "firmware scans at (the rig runs at 6 Hz since 2026-10)."
+        ),
+    )
     parser.add_argument("--crf", type=int, default=18)
     parser.add_argument(
         "--preset",
@@ -73,7 +82,7 @@ def parse_args():
         ),
     )
     args = parser.parse_args()
-    if args.fps <= 0:
+    if args.fps is not None and args.fps <= 0:
         parser.error("--fps must be positive")
     if args.cameras < 0:
         parser.error("--cameras must be non-negative")
@@ -137,6 +146,25 @@ def expected_camera_count(session, session_metadata, requested):
     if found < 1:
         raise RuntimeError(f"No camera_* directories in {session}")
     return found
+
+
+def measured_fps(camera_map, sequence):
+    """Capture rate from host timestamps; robust to dropped sets."""
+    stamps = [
+        (index, int(camera_map[index]["host_received_ns"]))
+        for index in sequence
+        if camera_map[index].get("host_received_ns")
+    ]
+    if len(stamps) < 3:
+        return None
+    rates = []
+    for (i0, t0), (i1, t1) in zip(stamps, stamps[1:]):
+        if t1 > t0 and i1 > i0:
+            rates.append((i1 - i0) * 1e9 / (t1 - t0))
+    if not rates:
+        return None
+    rates.sort()
+    return round(rates[len(rates) // 2], 1)
 
 
 def load_cameras(session, camera_count):
@@ -538,6 +566,125 @@ def write_alignment(
     }
 
 
+D455_COLUMNS = ("d455_frame_number", "d455_dt_ms", "d455_depth_png", "d455_color_jpg")
+
+
+def load_d455(session):
+    """Rows of <session>/d455/frames.csv by capture_sequence_index, or None."""
+    path = session / "d455" / "frames.csv"
+    if not path.is_file():
+        return None
+    return {int(row["capture_sequence_index"]): row for row in read_csv(path)}
+
+
+def encode_d455(ffmpeg, session, d455_rows, sequence, fps, crf, preset, overwrite,
+                suffix):
+    """Colour video and a colourised depth PREVIEW of the D455, frame for frame.
+
+    The preview is for looking at, not measuring: H.264 is lossy, so depth stays
+    in the uint16 PNGs written by align_d455.py. Frame k of both videos is the
+    D455 frame matched to frame k of the Blackfly videos.
+    """
+    import cv2
+
+    missing = [s for s in sequence if s not in d455_rows]
+    if missing:
+        raise RuntimeError(
+            f"{len(missing)} frame set(s) have no D455 frame (first: {missing[0]}); "
+            "re-run align_d455.py")
+    d455_dir = session / "d455"
+    meta_path = d455_dir / "d455.json"
+    meta = read_json(meta_path) if meta_path.is_file() else {}
+    scale = float(meta.get("depth_scale_m", 0.001))
+
+    # One fixed colour range for the whole clip, from the middle frame, so a
+    # dent reads as a colour change instead of being renormalised away.
+    middle = cv2.imread(str(d455_dir / "depth" / f"{sequence[len(sequence) // 2]:09d}.png"),
+                        cv2.IMREAD_UNCHANGED).astype(np.float32) * scale
+    valid = middle[middle > 0]
+    low, high = (np.percentile(valid, [2, 98]) if valid.size else (0.3, 1.0))
+    if high - low < 0.01:
+        high = low + 0.01
+
+    def run(output, frames):
+        if output.exists() and not overwrite:
+            raise RuntimeError(f"Output exists: {output}; use --overwrite")
+        command = [ffmpeg, "-hide_banner", "-loglevel", "error",
+                   "-y" if overwrite else "-n", "-f", "image2pipe",
+                   "-framerate", f"{fps:.9g}", "-i", "pipe:0", "-an", "-c:v", "libx264",
+                   "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p",
+                   "-movflags", "+faststart", str(output)]
+        print(f"Encoding D455 -> {output.name}")
+        process = subprocess.Popen(command, stdin=subprocess.PIPE)
+        try:
+            for chunk in frames:
+                process.stdin.write(chunk)
+            process.stdin.close()
+            if process.wait() != 0:
+                raise RuntimeError(f"ffmpeg failed for {output.name}")
+        except Exception:
+            process.kill()
+            process.wait()
+            raise
+        return output
+
+    def color_frames():
+        for index in sequence:
+            yield (d455_dir / "color" / f"{index:09d}.jpg").read_bytes()
+
+    def depth_frames():
+        for index in sequence:
+            depth = cv2.imread(str(d455_dir / "depth" / f"{index:09d}.png"),
+                               cv2.IMREAD_UNCHANGED).astype(np.float32) * scale
+            shown = cv2.applyColorMap(
+                np.clip((depth - low) / (high - low) * 255, 0, 255).astype(np.uint8),
+                cv2.COLORMAP_TURBO)
+            shown[depth <= 0] = 0
+            ok, data = cv2.imencode(".png", shown)
+            yield data.tobytes()
+
+    color_video = run(session / f"d455_color_{suffix}.mp4", color_frames())
+    depth_video = run(session / f"d455_depth_preview_{suffix}.mp4", depth_frames())
+    counts = [decoded_frame_count(ffmpeg, v) for v in (color_video, depth_video)]
+    if any(count != len(sequence) for count in counts):
+        raise RuntimeError(f"D455 video verification mismatch: expected {len(sequence)}, "
+                           f"decoded {counts}")
+    dts = [abs(float(d455_rows[i]["dt_ms"])) for i in sequence]
+    return {
+        "color_video": color_video.name,
+        "depth_preview_video": depth_video.name,
+        "depth_preview_range_m": [float(low), float(high)],
+        "depth_pngs": "d455/depth/<capture_sequence_index:09d>.png (uint16 x depth_scale_m)",
+        "depth_scale_m": scale,
+        "sync": meta.get("sync", "timestamp"),
+        "dt_ms_median": float(np.median(dts)),
+        "dt_ms_max": float(np.max(dts)),
+    }
+
+
+def add_d455_columns(alignment_path, d455_rows):
+    """Append the matched D455 frame to every row of the alignment table."""
+    with alignment_path.open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = [f for f in (reader.fieldnames or []) if f not in D455_COLUMNS]
+        rows = list(reader)
+    temporary = alignment_path.with_suffix(".csv.tmp")
+    with temporary.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames + list(D455_COLUMNS))
+        writer.writeheader()
+        for row in rows:
+            match = d455_rows.get(int(row["capture_sequence_index"]))
+            index = int(row["capture_sequence_index"])
+            row.update({
+                "d455_frame_number": match["d455_frame_number"] if match else "",
+                "d455_dt_ms": match["dt_ms"] if match else "",
+                "d455_depth_png": f"d455/depth/{index:09d}.png" if match else "",
+                "d455_color_jpg": f"d455/color/{index:09d}.jpg" if match else "",
+            })
+            writer.writerow({k: row.get(k, "") for k in fieldnames + list(D455_COLUMNS)})
+    temporary.replace(alignment_path)
+
+
 def delete_source_images(session, camera_maps, sequence):
     deleted_files = 0
     deleted_bytes = 0
@@ -568,6 +715,9 @@ def main():
         )
         camera_dirs, camera_maps, sequence = load_cameras(session, camera_count)
         print(f"Cameras: {camera_count} ({[d.name for d in camera_dirs]})")
+        if args.fps is None:
+            args.fps = measured_fps(camera_maps[0], sequence) or 24.0
+            print(f"Frame rate: {args.fps:g} fps (measured from capture timestamps)")
         if args.max_frames:
             sequence = sequence[: args.max_frames]
         sensor = load_sensor(session)
@@ -640,6 +790,12 @@ def main():
             sensor,
             force,
         )
+        d455_rows = load_d455(session)
+        d455_info = None
+        if d455_rows is not None:
+            d455_info = encode_d455(ffmpeg, session, d455_rows, sequence, args.fps,
+                                    args.crf, args.preset, args.overwrite, suffix)
+            add_d455_columns(alignment, d455_rows)
         metadata_path = session / "multimodal_video_export.json"
         metadata = {
             "fps": args.fps,
@@ -658,6 +814,9 @@ def main():
             "force_file": force["path"].name if force else None,
             **alignment_counts,
             "source_images_deleted": False,
+            # Kept out of "videos": the reconstruction expects exactly the
+            # Blackfly views there.
+            "d455": d455_info,
         }
         with metadata_path.open("w", encoding="utf-8") as handle:
             json.dump(metadata, handle, indent=2)
@@ -684,6 +843,9 @@ def main():
     print(f"Frames: {len(sequence)} at {args.fps:g} fps")
     print(f"Source color: {source_is_color}")
     print(f"Alignment: {alignment}")
+    if d455_info:
+        print(f"D455: {d455_info['color_video']}, {d455_info['depth_preview_video']} "
+              f"(|dt| median {d455_info['dt_ms_median']:.1f} ms; depth stays in d455/depth/*.png)")
     print(
         "Sensor mapping: "
         f"exact={alignment_counts['exact_sensor_frames']}, "

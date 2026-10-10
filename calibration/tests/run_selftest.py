@@ -125,6 +125,75 @@ def compare_to_truth(calibration: dict, truth: dict, flip: bool) -> None:
         check(offset < TOLERANCES["position_mm"], f"{name} position within {offset:.3f} mm")
 
 
+def test_layout(detections: Path, truth: dict) -> None:
+    """The capture plan must pair the cameras that really stand side by side."""
+    import rig_layout
+
+    data = np.load(detections)
+    corners, objects = data["corners"], data["object_points"].astype(np.float64)
+    width, height = truth["image_size"]
+    azimuths = {}
+    for ci in range(corners.shape[0]):
+        ids = np.flatnonzero(corners[ci, 0, :, 0] >= 0)
+        value = rig_layout.camera_azimuth(objects, ids, corners[ci, 0, ids],
+                                          rig_layout.nominal_K(width, height))
+        if value is not None:
+            azimuths[ci] = value
+    # Ground truth: azimuth of each true camera centre around the board centre.
+    middle = objects.mean(axis=0)
+    expected = {}
+    for ci, camera in enumerate(truth["cameras"]):
+        centre = np.asarray(camera["position_world"])
+        expected[ci] = float(np.degrees(np.arctan2(centre[1] - middle[1],
+                                                   centre[0] - middle[0])) % 360)
+    worst = max(abs((azimuths.get(c, 1e9) - expected[c] + 180) % 360 - 180) for c in expected)
+    check(worst < 10.0, f"camera azimuths from one uncalibrated world view within {worst:.1f} deg")
+    pairs = rig_layout.neighbour_pairs(azimuths)
+    wanted = rig_layout.neighbour_pairs(expected)
+    check(pairs == wanted, f"neighbour pairs {pairs} match the true layout {wanted}")
+    # The rig this repository actually runs: 0 and 1 face each other.
+    real = rig_layout.neighbour_pairs({0: 187.0, 1: 318.0, 2: 224.0, 3: 17.0})
+    check(real == [(0, 2), (1, 2), (1, 3)],
+          f"the 2026-09-30 rig pairs as {real}, never the opposite cameras 0+1 / 2+3")
+
+
+def test_inconsistent_frames(detections: Path, truth: dict, world_range: str,
+                             work: Path) -> None:
+    """Shift one camera's view in a few frames, as a board that moved between
+    the cameras' exposures does, and require the solve to drop those frames
+    and still land on the truth."""
+    data = dict(np.load(detections))
+    corners = data["corners"].copy()
+    rng = np.random.RandomState(3)
+    world_hi = int(world_range.split(":")[1])
+    seen_by_two = np.flatnonzero((data["counts"] > 20).sum(axis=0) >= 2)
+    candidates = seen_by_two[seen_by_two >= world_hi]
+    victims = np.sort(rng.choice(candidates, 6, replace=False))
+    for fi in victims:
+        cam = int(np.flatnonzero(data["counts"][:, fi] > 20)[-1])
+        seen = corners[cam, fi, :, 0] >= 0
+        corners[cam, fi, seen] += np.array([7.0, -5.0], np.float32)
+    data["corners"] = corners
+    moved = work / "detections_moved.npz"
+    np.savez(moved, **data)
+    moved.with_suffix(".json").write_text(
+        detections.with_suffix(".json").read_text(encoding="utf-8"), encoding="utf-8")
+    out = work / "calibration_moved.json"
+    run("calibrate.py", moved, "--out", out, "--world-frames", world_range, "--world-flip-z")
+    calibration = json.loads(out.read_text(encoding="utf-8"))
+    frame_indices = list(int(v) for v in data["frame_indices"])
+    rejected = set(calibration["source"]["bundle_refinement"].get("frames_rejected", []))
+    planted = {int(v) for v in victims}
+    holdout = {frame_indices.index(v) for v in calibration["source"]["frames_holdout"]}
+    planted_in_solve = planted - holdout
+    check(planted_in_solve <= rejected,
+          f"rejected {len(rejected & planted_in_solve)}/{len(planted_in_solve)} "
+          "planted inconsistent frames")
+    check(len(rejected - planted) <= 2,
+          f"{len(rejected - planted)} clean frame(s) rejected by mistake")
+    compare_to_truth(calibration, truth, flip=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work-dir", type=Path, required=True)
@@ -184,6 +253,14 @@ def main() -> int:
     check(common_calibration["metrics"]["multiview_rms_px"] < 1.0,
           f"sub-pattern solve stays converged "
           f"({common_calibration['metrics']['multiview_rms_px']:.3f} px)")
+
+    print()
+    print("planning the capture from the world pose (rig_layout)")
+    test_layout(detections, truth)
+
+    print()
+    print("frames where the board moved between exposures (bundle rejection)")
+    test_inconsistent_frames(detections, truth, world_range, work)
 
     print()
     print("validating on held-out frames")
