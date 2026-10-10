@@ -300,10 +300,23 @@ def export_rerun(
     pointcloud_radius_m: float | None = 0.5, pointcloud_point_radius_m: float = 0.001,
     pointcloud_mode: str = "fused",
     show_progress: bool = False,
+    session_dir: Path | None = None,
+    log_views: bool = True,
+    view_depth_downsample: int = 2,
 ) -> None:
     import rerun as rr
+    from scripts.rerun_views import CameraViewLogger, build_blueprint, load_d455_frames, load_indentation
 
     rr.init("mvtracker_data_test", recording_id=path.parent.name)
+    views = None
+    if log_views:
+        # indentation.csv (eval_indentation.py) next to the .rrd adds the force-gauge comparison.
+        views = CameraViewLogger(clip, depths_m, load_d455_frames(session_dir), view_depth_downsample,
+                                 indentation=load_indentation(path.parent))
+    # Stream straight to disk instead of buffering the whole recording in RAM.
+    rr.save(path, default_blueprint=build_blueprint(
+        clip.camera_serials, views.d455, depths_m is not None, views.indentation is not None,
+    ) if views else None)
     rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
     for view, serial in enumerate(clip.camera_serials):
         E = clip.extrinsics_w2c_m[view, 0]
@@ -323,6 +336,8 @@ def export_rerun(
             ),
             static=True,
         )
+    if views is not None:
+        views.log_static()
     rng = np.random.default_rng(72)
     colors = rng.integers(40, 256, size=(tracks.shape[1], 3), dtype=np.uint8)
     for t, time_s in tqdm(
@@ -367,7 +382,9 @@ def export_rerun(
                 strip_colors.append(colors[n])
         if strips:
             rr.log("world/tracks/history", rr.LineStrips3D(strips, colors=strip_colors, radii=0.0007))
-    rr.save(path)
+        if views is not None:
+            views.log_frame(t, tracks[t], visible, colors)
+    rr.disconnect()  # flush and close the .rrd
 
 
 def parse_roi(value: str) -> tuple[float, float, float, float]:
@@ -451,6 +468,8 @@ def main() -> None:
     parser.add_argument("--rerun-pointcloud-mode", choices=["fused", "per-view"], default="fused")
     parser.add_argument("--no-dense-ply", action="store_true")
     parser.add_argument("--no-dense-rerun", action="store_true")
+    parser.add_argument("--no-rerun-views", action="store_true",
+                        help="Skip RGB / predicted-depth / D455 image streams in tracks_4d.rrd")
     parser.add_argument("--checkpoint", type=Path, default=MVTRACKER_ROOT / "checkpoints/mvtracker_200000_june2025.pth")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--iterations", type=int, default=6)
@@ -544,7 +563,9 @@ def main() -> None:
         device=args.device,
         checkpoint="mvtracker_main",
         model_kwargs={"use_flash_attention": True, "normalize_scene_in_fwd_pass": False},
-        predictor_kwargs={"interp_shape": (args.height, args.width), "n_iters": args.iterations},
+        # Frames are already decoded at --width/--height; interp_shape=None skips a
+        # same-size F.interpolate that would duplicate the whole RGB-D video in VRAM.
+        predictor_kwargs={"interp_shape": None, "n_iters": args.iterations},
     )
     report("5/8 model", f"checkpoint loaded; {cuda_memory(args.device)}", show_progress)
     report("6/8 inference", "moving input tensors to device", show_progress)
@@ -620,6 +641,8 @@ def main() -> None:
         pointcloud_point_radius_m=args.pointcloud_point_radius_m,
         pointcloud_mode=args.rerun_pointcloud_mode,
         show_progress=show_progress,
+        session_dir=args.session_dir,
+        log_views=not args.no_rerun_views,
     )
     metadata = {
         "session_dir": str(args.session_dir.resolve()),

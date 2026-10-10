@@ -11,6 +11,7 @@ import signal
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -185,7 +186,13 @@ def render_video(
         output_path = render_dir / f"deformation_tracks_{stamp}.mp4"
         ffmpeg = shutil.which("ffmpeg")
         if ffmpeg is None:
-            raise RuntimeError("ffmpeg is not installed or not in PATH")
+            # Windows rarely has ffmpeg on PATH; moviepy's imageio-ffmpeg ships one.
+            try:
+                import imageio_ffmpeg
+
+                ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+            except (ImportError, RuntimeError):
+                raise RuntimeError("ffmpeg is not installed or not in PATH") from None
         command = [
             ffmpeg,
             "-y",
@@ -346,6 +353,14 @@ def _port_is_open(host: str, port: int) -> bool:
 def _terminate_process_group(process: subprocess.Popen) -> None:
     if process.poll() is not None:
         return
+    if not hasattr(os, "killpg"):  # Windows has no process groups via killpg
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        return
     try:
         os.killpg(process.pid, signal.SIGTERM)
         process.wait(timeout=5)
@@ -377,7 +392,8 @@ def start_rerun_viewer(
     global _RERUN_PROCESS, _RERUN_RESULT
     result_dir = resolve_result_dir(result_dir_value)
     rrd_path = result_dir / "tracks_4d.rrd"
-    rerun_cli = shutil.which("rerun")
+    # Also look next to the interpreter so an unactivated venv still finds its rerun CLI.
+    rerun_cli = shutil.which("rerun") or shutil.which("rerun", path=str(Path(sys.executable).parent))
     if rerun_cli is None:
         raise RuntimeError("rerun CLI is not installed in the active environment")
     with _RERUN_LOCK:

@@ -56,3 +56,6 @@ reconstruction/submodule/MoGe/
 calibration/camera_check/
 sensor-data-collection/test/cell_check/
 calibration/board_d455/*.png
+
+# Local capture sessions (large; keep on disk, never commit)
+sensor-data-collection/test/data/

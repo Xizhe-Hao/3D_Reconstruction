@@ -259,28 +259,61 @@ def test_board(rig: Rig, depths: np.ndarray, frames: list[int],
     return result
 
 
+def rim_distance(xy: np.ndarray, centre_xy, rect=None, angle_deg: float = 0.0) -> np.ndarray:
+    """Distance (mm) in the xy plane from the indenter's outline.
+
+    Round indenter (rect None): distance from the axis, so --ring is a radius
+    range. Rectangular indenter (rect = (length, width), long side at
+    angle_deg from world +x): distance from the rectangle's edge, 0 on and
+    inside it, so --ring is how far outside the edge to read the surface.
+    """
+    d = xy - np.asarray(centre_xy, np.float64)
+    if rect is None:
+        return np.hypot(d[:, 0], d[:, 1])
+    a = np.radians(angle_deg)
+    along = np.abs(d[:, 0] * np.cos(a) + d[:, 1] * np.sin(a)) - rect[0] / 2
+    across = np.abs(-d[:, 0] * np.sin(a) + d[:, 1] * np.cos(a)) - rect[1] / 2
+    return np.hypot(np.maximum(along, 0), np.maximum(across, 0))
+
+
 def test_press(rig: Rig, depths: np.ndarray, frames: list[int], centre_xy, ring,
-               travel_mm: np.ndarray, load: np.ndarray, contact_load: float, box) -> dict:
+               travel_mm: np.ndarray, load: np.ndarray, contact_load: float, box,
+               rect=None, angle_deg: float = 0.0, above_mm: float = 2.0) -> dict:
     """Reconstructed dent at the indenter rim vs crosshead travel since contact."""
     r_in, r_out = ring
     views = depths.shape[0]
-    # Height per camera, not pooled: cameras disagree by a constant offset (the
-    # board test measures it), and a pooled median drifts as the mix of
-    # cameras seeing the ring changes during the press.
-    heights = np.full((len(frames), views), np.nan)
-    for k, t in enumerate(frames):
-        for view in range(views):
-            world, _ = rig.backproject(view, depths[view, t])
-            world = world[in_box(world, box)]
-            radius = np.hypot(world[:, 0] - centre_xy[0], world[:, 1] - centre_xy[1])
-            values = world[(radius >= r_in) & (radius <= r_out), 2]
-            if values.size >= 10:
-                heights[k, view] = np.median(values)
-
     loaded = load >= contact_load
     if not loaded.any() or loaded.all():
         return {"error": f"no frame crosses the contact load {contact_load:g}; "
                          "set --contact-load or check the force import"}
+    band = [[None] * views for _ in frames]
+    for k, t in enumerate(frames):
+        for view in range(views):
+            world, _ = rig.backproject(view, depths[view, t])
+            world = world[in_box(world, box)]
+            radius = rim_distance(world[:, :2], centre_xy, rect, angle_deg)
+            band[k][view] = world[(radius >= r_in) & (radius <= r_out), 2]
+    # A press only lowers the surface. Seen obliquely, the indenter's side
+    # faces fall inside the band and stand far above it (on 2026-10-09 most
+    # band points at the deepest hold were the indenter), so anything more
+    # than above_mm over the unloaded surface before the first contact is
+    # the indenter, its rod or a hand, and is dropped.
+    first = int(np.argmax(loaded))
+    ceiling = np.full(views, np.inf)
+    for view in range(views):
+        rest = [np.median(band[k][view]) for k in range(first) if band[k][view].size >= 10]
+        if rest:
+            ceiling[view] = np.median(rest) + above_mm
+    # Height per camera, not pooled: cameras disagree by a constant offset (the
+    # board test measures it), and a pooled median drifts as the mix of
+    # cameras seeing the ring changes during the press.
+    heights = np.full((len(frames), views), np.nan)
+    for k in range(len(frames)):
+        for view in range(views):
+            values = band[k][view]
+            values = values[values <= ceiling[view]]
+            if values.size >= 10:
+                heights[k, view] = np.median(values)
     # Each press is measured from its own start: a soft object does not fully
     # recover between presses (on 2026-10-08 the contact height crept down by
     # 0.9 mm over four presses), so both the zero of the travel and the
@@ -350,14 +383,15 @@ def test_press(rig: Rig, depths: np.ndarray, frames: list[int], centre_xy, ring,
 
 
 def locate_dent(rig: Rig, depths: np.ndarray, reference: list[int], loaded: int,
-                box, cell: float = 1.0):
+                box, cell: float = 1.0, with_angle: bool = False):
     """Where the surface went down the most: the indenter's axis, roughly.
 
     Fused height maps (median z per 1 mm cell over all cameras) before contact
     and at peak load are differenced. The indenter itself occludes the bottom
     of the dent and stands above the surface, so the deepest cells form a ring
     around it; the centroid of the cells within half the maximum depression is
-    the axis.
+    the axis. With `with_angle`, also returns the direction of their principal
+    axis (degrees from world +x, in [0, 180)): a rectangular indenter's long side.
     """
     x0, x1, y0, y1 = box[:4]
     nx, ny = int((x1 - x0) / cell), int((y1 - y0) / cell)
@@ -389,7 +423,14 @@ def locate_dent(rig: Rig, depths: np.ndarray, reference: list[int], loaded: int,
     if deepest <= 0:
         return None
     rows, cols = np.nonzero(np.nan_to_num(dent, nan=-np.inf) >= 0.5 * deepest)
-    return [float(x0 + (cols.mean() + 0.5) * cell), float(y0 + (rows.mean() + 0.5) * cell)]
+    centre = [float(x0 + (cols.mean() + 0.5) * cell), float(y0 + (rows.mean() + 0.5) * cell)]
+    if not with_angle:
+        return centre
+    if rows.size < 3:
+        return centre, 0.0
+    _, vectors = np.linalg.eigh(np.cov(np.stack([cols, rows]).astype(np.float64)))
+    major = vectors[:, -1]
+    return centre, float(np.degrees(np.arctan2(major[1], major[0])) % 180.0)
 
 
 # ------------------------------------------------------------------ inputs
@@ -609,6 +650,33 @@ def selftest() -> int:
     expect("error" not in press and abs(press["slope_dent_per_travel"] - 0.97) < 0.06,
            f"press slope {press.get('slope_dent_per_travel', float('nan')):.3f} "
            "(surface inside r=3 mm of a 12 mm Gaussian dent: ~0.97)")
+
+    # Rectangular punch, 35 x 10 mm at 30 deg: flat-bottomed dent, falling off
+    # outside the edge as exp(-(edge distance / 6 mm)^2).
+    rect, rect_angle = (35.0, 10.0), 30.0
+    rect_depths = np.zeros_like(depths)
+    for view in range(V):
+        for t in range(T):
+            def height(x, y, d=dent_depth[t]):
+                xy = np.stack([x.ravel(), y.ravel()], axis=1)
+                edge = rim_distance(xy, centre, rect, rect_angle).reshape(x.shape)
+                return -d * np.exp(-(edge / 6.0) ** 2)
+            depth = plane_depth(view, height) + rng.normal(0, noise, (H, W))
+            rect_depths[view, t] = np.where(depth > 0, depth / 1000.0, 0)
+    found = locate_dent(rig, rect_depths, [0], T - 1, box, with_angle=True)
+    turn = abs((found[1] - rect_angle + 90) % 180 - 90) if found else np.inf
+    expect(turn < 5, f"rectangular dent long side at {found[1] if found else np.nan:.1f} deg "
+           f"(planted {rect_angle:g})")
+    press = test_press(rig, rect_depths, list(range(T)), centre, (0.5, 1.5), travel, load, 0.5,
+                       box, rect, rect_angle)
+    expect("error" not in press and abs(press["slope_dent_per_travel"] - 0.97) < 0.04,
+           f"rectangular press slope {press.get('slope_dent_per_travel', float('nan')):.3f} "
+           "(band 0.5-1.5 mm outside the edge: ~0.97)")
+    round_press = test_press(rig, rect_depths, list(range(T)), centre, (18.5, 21.5), travel,
+                             load, 0.5, box)
+    expect("error" not in round_press and round_press["slope_dent_per_travel"] < 0.8,
+           f"a round ring outside the half-diagonal reads slope "
+           f"{round_press.get('slope_dent_per_travel', float('nan')):.3f}: biased low, as expected")
     print(f"\n{'SELFTEST PASSED' if not failures else f'{len(failures)} FAILED'}")
     return 1 if failures else 0
 
@@ -637,7 +705,16 @@ def main() -> int:
                              "from where the surface went down most at peak load")
     parser.add_argument("--ring", type=floats(2), default=[5.0, 9.0], metavar="R_IN,R_OUT",
                         help="annulus (mm) around the indenter axis to read the surface in; "
-                             "start just outside the indenter's radius")
+                             "start just outside the indenter's radius. With --press-rect: "
+                             "band this far outside the rectangle's edge, e.g. 1,4")
+    parser.add_argument("--press-rect", type=floats(2), metavar="LENGTH,WIDTH",
+                        help="rectangular indenter face (mm); --ring is then measured from its edge")
+    parser.add_argument("--press-angle", type=float, metavar="DEG",
+                        help="long side of --press-rect, degrees from world +x; default: "
+                             "the principal axis of the dent at peak load")
+    parser.add_argument("--above-mm", type=float, default=2.0,
+                        help="press: drop band points this far above the unloaded surface "
+                             "(the indenter seen side-on)")
     parser.add_argument("--distance-unit", choices=["mm", "in"], default="mm",
                         help="unit of force_distance in the Mark-10 export")
     parser.add_argument("--contact-load", type=float, default=None,
@@ -725,19 +802,31 @@ def main() -> int:
                              "run align_force_curve_only.py and re-export first")
         contact = args.contact_load if args.contact_load is not None else 0.05 * np.nanmax(load)
         keep = np.isfinite(travel) & np.isfinite(load)
-        centre = args.press_xy
-        if centre is None:
+        centre, angle = args.press_xy, args.press_angle
+        if centre is None or (args.press_rect and angle is None):
             unloaded = [picked[i] for i in np.flatnonzero(keep & (load < contact))]
             peak = picked[int(np.nanargmax(np.where(keep, load, -np.inf)))]
-            centre = locate_dent(rig, depths, unloaded or [picked[0]], peak, box)                 if unloaded else None
+            found = locate_dent(rig, depths, unloaded, peak, box, with_angle=True) \
+                if unloaded else None
+            if found is None:
+                raise SystemExit("could not find the dent; give --press-xy X,Y (mm)"
+                                 + (" and --press-angle" if args.press_rect else ""))
             if centre is None:
-                raise SystemExit("could not find the dent; give --press-xy X,Y (mm)")
-            print(f"indenter axis located at ({centre[0]:.1f}, {centre[1]:.1f}) mm "
-                  "-- pass --press-xy to override")
+                centre = found[0]
+                print(f"indenter axis located at ({centre[0]:.1f}, {centre[1]:.1f}) mm "
+                      "-- pass --press-xy to override")
+            if args.press_rect and angle is None:
+                angle = found[1]
+                print(f"indenter long side at {angle:.1f} deg from world +x "
+                      "-- pass --press-angle to override")
         report["press"] = test_press(rig, depths, [picked[i] for i in np.flatnonzero(keep)],
                                      centre, args.ring, travel[keep], load[keep],
-                                     contact, box)
+                                     contact, box, args.press_rect, angle or 0.0,
+                                     args.above_mm)
         report["press"]["centre_xy"] = centre
+        if args.press_rect:
+            report["press"]["rect_mm"] = args.press_rect
+            report["press"]["angle_deg"] = angle
     print_report(report)
     if args.report:
         args.report.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
