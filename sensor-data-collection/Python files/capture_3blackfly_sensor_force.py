@@ -622,6 +622,15 @@ def configure_camera(camera, args):
     nodemap = camera.GetNodeMap()
     stream_nodemap = camera.GetTLStreamNodeMap()
 
+    # A tool that exited without stopping acquisition leaves the camera
+    # acquiring, which makes PixelFormat/Width/Height read-only.
+    stop = PySpin.CCommandPtr(nodemap.GetNode("AcquisitionStop"))
+    if is_available_writable(stop):
+        try:
+            stop.Execute()
+        except PySpin.SpinnakerException:
+            pass
+
     set_enum(nodemap, "TriggerMode", "Off")
     set_enum(nodemap, "TriggerSelector", "FrameStart")
     set_enum(nodemap, "TriggerSource", args.trigger_source)

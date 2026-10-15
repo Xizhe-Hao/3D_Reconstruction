@@ -58,7 +58,7 @@
 
 #define PIN_CAMERA_TRIGGER        9
 #define CAMERA_TRIGGER_PULSE_US   100
-#define FRAME_PERIOD_US           41667UL  // 24 fps
+#define FRAME_PERIOD_US           166667UL // 6 fps
 
 #define MUX_SETTLE_TIME_US        20
 #define READY_INTERVAL_MS         250UL
@@ -130,8 +130,11 @@ void setup()
   setMuxAddress(PIN_COLUMN_MUX_S0, PIN_COLUMN_MUX_S1,
                 PIN_COLUMN_MUX_S2, PIN_COLUMN_MUX_S3, 0);
 
+#if defined(ADCSRA) && defined(ADPS2) && defined(ADPS1) && defined(ADPS0)
+  // Only adjust the ADC clock on boards with these registers.
   ADCSRA = (ADCSRA & ~(_BV(ADPS2) | _BV(ADPS1) | _BV(ADPS0)))
            | _BV(ADPS2) | _BV(ADPS0);
+#endif
 
   enterWaitingState();
 }

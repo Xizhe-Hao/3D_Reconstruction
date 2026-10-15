@@ -52,6 +52,7 @@ from pathlib import Path
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
+MAX_D455_DT_MS = 40.0   # D455 frames matched further apart than this are skipped
 sys.path.insert(0, str(ROOT / "reconstruction" / "scripts"))
 
 
@@ -115,8 +116,19 @@ def d455_source(session: Path, d455_world: Path):
     corr = w.get("depth_correction") or {"scale_error": 0.0, "offset_mm": 0.0}
     scale_mm = float(w["depth_scale_m"]) * 1000.0
     cache = {}
+    # A host-side stall delays Blackfly arrival times, so the timestamp match
+    # can pick a D455 frame from a different moment; skip those sets.
+    dt_ms = {}
+    frames_csv = session / "d455" / "frames.csv"
+    if frames_csv.exists():
+        with frames_csv.open(newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                if row.get("dt_ms"):
+                    dt_ms[int(row["capture_sequence_index"])] = float(row["dt_ms"])
 
     def points(sequence: int):
+        if abs(dt_ms.get(sequence, 0.0)) > MAX_D455_DT_MS:
+            return None
         path = session / "d455" / "depth" / f"{sequence:09d}.png"
         if not path.exists():
             return None

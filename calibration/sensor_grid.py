@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
 """Where each of the 16x16 tactile cells is in the world frame.
 
+    python calibration/sensor_grid.py --session <capture session> --tags   # AprilTag corners, no clicking
     python calibration/sensor_grid.py --session <capture session>          # click the tapes
     python calibration/sensor_grid.py --from-clicks <sensor_grid.json>     # recompute
     python calibration/sensor_grid.py --selftest
+
+With --tags the corners are the AprilTags from make_sensor_template.py
+(tag36h11, ID 0 = R1C1, 1 = R1C16, 2 = R16C16, 3 = R16C1), found automatically
+in every view: the ID names the corner, so orientation cannot be mixed up.
+Each tag's four corners are triangulated, and its inner corner is the one
+nearest the centre of the four tags -- decided in 3D, so the viewing angle
+does not matter. The triangulated tag size is checked against the printed
+size, and with one tag hidden the fourth corner is completed as a
+parallelogram. Tags placed as the template says (inner corner ON the corner of
+the 120 mm active area) give a tape offset of 3.75 mm.
 
 RUN WITH THE CALIBRATION ENVIRONMENT (.venv-calib).
 
@@ -278,6 +289,79 @@ def consistency(rig, clicks: dict):
     return lines
 
 
+# ------------------------------------------------------------------ AprilTags
+TAG_IDS = {0: "R1C1", 1: "R1C16", 2: "R16C16", 3: "R16C1"}
+TAG_OFFSET_MM = 3.75     # inner corner on the active-area corner -> half a pitch to R1C1
+
+
+def detect_tags(image, dictionary="DICT_APRILTAG_36h11"):
+    """{tag id: (4, 2) pixel corners} for IDs 0-3; an ID seen twice is dropped."""
+    params = cv.aruco.DetectorParameters()
+    params.cornerRefinementMethod = cv.aruco.CORNER_REFINE_SUBPIX
+    params.cornerRefinementWinSize = 4
+    detector = cv.aruco.ArucoDetector(cv.aruco.getPredefinedDictionary(
+        getattr(cv.aruco, dictionary)), params)
+    corners, ids, _ = detector.detectMarkers(image)
+    found, duplicate = {}, set()
+    if ids is not None:
+        for tag_id, quad in zip(np.asarray(ids).ravel(), corners):
+            tag_id = int(tag_id)
+            if tag_id not in TAG_IDS:
+                continue
+            if tag_id in found:
+                duplicate.add(tag_id)
+            found[tag_id] = np.asarray(quad, float).reshape(4, 2)
+    for tag_id in duplicate:
+        found.pop(tag_id)
+    return found, sorted(duplicate)
+
+
+def solve_tags(rig, detections: dict[str, dict], pitch, cells, offset, tag_mm=None):
+    """Grid from AprilTag detections {view: {tag id: (4,2)}}."""
+    tag_points, tag_residual = {}, {}
+    for tag_id in TAG_IDS:
+        seen = {int(v): np.asarray(d[str(tag_id)] if str(tag_id) in d else d[tag_id], float)
+                for v, d in detections.items() if str(tag_id) in d or tag_id in d}
+        if len(seen) < 2:
+            continue
+        points, residuals = [], []
+        for k in range(4):                       # a tag's corner order is view-independent
+            point, residual = triangulate(rig, {v: quad[k] for v, quad in seen.items()})
+            points.append(point)
+            residuals.append(residual)
+        tag_points[tag_id] = np.stack(points)
+        tag_residual[tag_id] = float(np.max(residuals))
+    if len(tag_points) < 3:
+        raise SystemExit(f"only tags {sorted(tag_points)} were seen by two cameras; need 3 of 0-3")
+    centre = np.mean([pts.mean(axis=0) for pts in tag_points.values()], axis=0)
+    corners, residuals, inner_index = {}, {}, {}
+    for tag_id, pts in tag_points.items():
+        k = int(np.argmin(np.linalg.norm(pts - centre, axis=1)))
+        inner_index[tag_id] = k
+        corners[TAG_IDS[tag_id]] = pts[k]
+        residuals[TAG_IDS[tag_id]] = tag_residual[tag_id]
+    completed = None
+    if len(corners) == 3:                        # parallelogram: opposite corners share a midpoint
+        missing = next(name for name in CORNERS if name not in corners)
+        i = CORNERS.index(missing)
+        opposite, a, b = CORNERS[(i + 2) % 4], CORNERS[(i + 1) % 4], CORNERS[(i + 3) % 4]
+        corners[missing] = corners[a] + corners[b] - corners[opposite]
+        residuals[missing] = float("nan")
+        completed = missing
+    grid = fit_grid(corners, pitch, cells, offset)
+    grid["corners"] = corners
+    grid["click_residual_px"] = residuals
+    sizes = {TAG_IDS[t]: float(np.mean([np.linalg.norm(p[k] - p[(k + 1) % 4]) for k in range(4)]))
+             for t, p in tag_points.items()}
+    grid["checks"]["tag_size_mm"] = sizes
+    if tag_mm:
+        grid["checks"]["tag_size_printed_mm"] = tag_mm
+    grid["checks"]["completed_corner"] = completed
+    grid["inner_index"] = inner_index
+    grid["tag_points"] = tag_points
+    return grid
+
+
 # ------------------------------------------------------------------ solve + report
 def solve(rig, clicks: dict[str, dict], pitch, cells, offset):
     corners, residuals = {}, {}
@@ -294,11 +378,13 @@ def solve(rig, clicks: dict[str, dict], pitch, cells, offset):
 
 
 def report(grid, offset):
-    print("tape inner corners (world mm) and click consistency:")
+    print("corner marks, inner corners (world mm) and consistency between views:")
     for name in CORNERS:
         p = grid["corners"][name]
-        print(f"   {name:7s} ({p[0]:7.1f}, {p[1]:7.1f}, {p[2]:6.1f})   views disagree by "
-              f"{grid['click_residual_px'][name]:.1f} px")
+        r = grid["click_residual_px"][name]
+        note = "completed from the other three" if not np.isfinite(r) else \
+            f"views disagree by {r:.1f} px"
+        print(f"   {name:7s} ({p[0]:7.1f}, {p[1]:7.1f}, {p[2]:6.1f})   {note}")
     checks = grid["checks"]
     print("tape square sides: " + ", ".join(f"{k} {v:.1f}" for k, v in checks["sides_mm"].items())
           + f" mm  (expected {checks['expected_side_mm']:.1f} for a {offset:g} mm offset)")
@@ -313,8 +399,19 @@ def report(grid, offset):
                         "mis-clicked, or the tapes are not placed alike")
     if checks["skew_from_square_deg"] > 3:
         warnings.append("the tape quadrilateral is not square -- check the click order")
-    if max(grid["click_residual_px"].values()) > 4:
-        warnings.append("a corner's clicks disagree by > 4 px between views -- re-click it")
+    finite = [v for v in grid["click_residual_px"].values() if np.isfinite(v)]
+    if finite and max(finite) > 4:
+        warnings.append("a corner disagrees by > 4 px between views -- re-click it, or the "
+                        "cameras have moved since calibration.json")
+    sizes = checks.get("tag_size_mm")
+    if sizes:
+        print("tag edge as triangulated: " + ", ".join(f"{k} {v:.2f}" for k, v in sizes.items())
+              + " mm" + (f"  (printed {checks['tag_size_printed_mm']:g} mm)"
+                         if checks.get("tag_size_printed_mm") else ""))
+        printed = checks.get("tag_size_printed_mm")
+        if printed and max(abs(v - printed) for v in sizes.values()) > 0.6:
+            warnings.append("a tag's size is off by > 0.6 mm -- check the print scale or "
+                            "whether the calibration still fits")
     for w in warnings:
         print("WARNING: " + w)
     return warnings
@@ -342,7 +439,7 @@ def overlays(rig, grid, images, out_dir: Path):
     print(f"overlays: {out_dir}  (red = R1C1, orange = row 1, green = the rest)")
 
 
-def save(path: Path, grid, clicks, args, session, frame):
+def save(path: Path, grid, clicks, args, session, frame, tags=None):
     payload = {
         "schema": "sensor-grid/1",
         "created_utc": datetime.now(timezone.utc).isoformat(),
@@ -361,6 +458,8 @@ def save(path: Path, grid, clicks, args, session, frame):
         "checks": grid["checks"],
         "click_residual_px": grid["click_residual_px"],
         "clicks": clicks,
+        "method": "apriltag" if tags else "clicks",
+        "tag_detections": tags,
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(f"wrote {path}")
@@ -393,6 +492,34 @@ def selftest(args) -> int:
     ok = error.max() < 0.6 and abs(grid["checks"]["implied_tape_offset_mm"] - args.tape_offset) < 0.5
     print(f"cell centre error with 2 px click noise: median {np.median(error):.2f} mm, "
           f"max {error.max():.2f} mm")
+    # AprilTags: 12 mm tags, inner corners ON the active-area corners, random
+    # corner order per tag (the detector's order depends on how it was glued).
+    s_tag = 12.0
+    half_area = args.cells * args.pitch / 2
+    detections = {str(v): {} for v in range(len(rig))}
+    for tag_id, (sx, sy) in zip(TAG_IDS, [(-1, -1), (1, -1), (1, 1), (-1, 1)]):
+        inner = centre + sx * half_area * x + sy * half_area * y
+        quad = np.stack([inner, inner + sx * s_tag * x, inner + sx * s_tag * x + sy * s_tag * y,
+                         inner + sy * s_tag * y])
+        quad = np.roll(quad, rng.integers(4), axis=0)
+        for view in range(len(rig)):
+            uv = project(rig, view, quad)
+            if ((uv >= 0) & (uv < [2048, 1536])).all():
+                detections[str(view)][str(tag_id)] = (uv + rng.normal(0, 0.3, uv.shape)).tolist()
+    tag_grid = solve_tags(rig, detections, args.pitch, args.cells, TAG_OFFSET_MM, s_tag)
+    report(tag_grid, TAG_OFFSET_MM)
+    tag_error = np.linalg.norm(tag_grid["cell_centres"] - expected, axis=-1)
+    sizes_ok = all(abs(v - s_tag) < 0.3 for v in tag_grid["checks"]["tag_size_mm"].values())
+    print(f"AprilTag path: cell centre error median {np.median(tag_error):.3f} mm, max "
+          f"{tag_error.max():.3f} mm; implied offset "
+          f"{tag_grid['checks']['implied_tape_offset_mm']:.2f} mm (placed at {TAG_OFFSET_MM})")
+    # and with tag 2 hidden
+    hidden = {v: {t: q for t, q in d.items() if t != "2"} for v, d in detections.items()}
+    three = solve_tags(rig, hidden, args.pitch, args.cells, TAG_OFFSET_MM, s_tag)
+    three_error = np.linalg.norm(three["cell_centres"] - expected, axis=-1)
+    print(f"with tag 2 hidden (corner completed): max cell error {three_error.max():.3f} mm")
+    ok = (ok and tag_error.max() < 0.3 and sizes_ok and three_error.max() < 0.5
+          and abs(tag_grid["checks"]["implied_tape_offset_mm"] - TAG_OFFSET_MM) < 0.3)
     print("SELFTEST PASSED" if ok else "SELFTEST FAILED")
     return 0 if ok else 1
 
@@ -409,20 +536,42 @@ def main() -> int:
     parser.add_argument("--calibration", type=Path, default=HERE / "calibration.json")
     parser.add_argument("--pitch", type=float, default=7.5)
     parser.add_argument("--cells", type=int, default=16)
-    parser.add_argument("--tape-offset", type=float, default=7.0,
-                        help="tape inner corner to the nearest cell centre (only a check)")
+    parser.add_argument("--tags", action="store_true",
+                        help="find the corner AprilTags automatically instead of clicking")
+    parser.add_argument("--tag-mm", type=float, default=None,
+                        help="printed black-square size of the tags, for the size check "
+                             "(12 or 15 from the template)")
+    parser.add_argument("--tape-offset", type=float, default=None,
+                        help="corner mark's inner corner to the nearest cell centre (only a "
+                             "check); default 7 for the tapes, 3.75 for the AprilTags")
     parser.add_argument("--out", type=Path, default=HERE / "sensor_grid.json")
     parser.add_argument("--selftest", action="store_true")
     args = parser.parse_args()
+    if args.tape_offset is None:
+        args.tape_offset = TAG_OFFSET_MM if args.tags else 7.0
     if args.selftest:
         return selftest(args)
 
     rig = load_rig(args.calibration)
+    tags = None
     if args.from_clicks:
         saved = json.loads(args.from_clicks.read_text(encoding="utf-8"))
         clicks = saved["clicks"]
+        tags = saved.get("tag_detections")
         session = Path(saved["session"]) if saved.get("session") else None
         frame = saved.get("capture_sequence_index")
+    elif args.tags:
+        if args.session is None:
+            parser.error("--session is required")
+        session, frame = args.session.expanduser().resolve(), args.frame
+        tags, clicks = {}, {}
+        for view in (int(v) for v in args.views.split(",")):
+            image, frame_used = load_frame(session, view, frame)
+            frame = frame if frame is not None else frame_used
+            found, duplicate = detect_tags(image)
+            tags[str(view)] = {str(t): q.tolist() for t, q in found.items()}
+            print(f"camera {view}: tags {sorted(found)}"
+                  + (f"  (ignored, seen twice: {duplicate})" if duplicate else ""))
     else:
         if args.session is None:
             parser.error("--session (or --from-clicks) is required")
@@ -443,9 +592,16 @@ def main() -> int:
                     if answer in ("", "y", "yes"):
                         continue
                 break
-    grid = solve(rig, clicks, args.pitch, args.cells, args.tape_offset)
+    if tags:
+        grid = solve_tags(rig, tags, args.pitch, args.cells, args.tape_offset, args.tag_mm)
+        # the inner-corner pixels, so the file also works like a clicked one
+        clicks = {v: {TAG_IDS[int(t)]: (q[grid["inner_index"][int(t)]]
+                                        if int(t) in grid["inner_index"] else None)
+                      for t, q in d.items()} for v, d in tags.items()}
+    else:
+        grid = solve(rig, clicks, args.pitch, args.cells, args.tape_offset)
     report(grid, args.tape_offset)
-    save(args.out, grid, clicks, args, session, frame)
+    save(args.out, grid, clicks, args, session, frame, tags)
     if session is not None and session.exists():
         images = {int(v): load_frame(session, int(v), frame)[0] for v in clicks}
         overlays(rig, grid, images, session / "sensor_grid")

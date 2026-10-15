@@ -584,7 +584,17 @@ class Rig:
         board = (focus_check.board_sharpness(gray, corners)
                  if corners is not None and len(corners) >= 8 else None)
 
-        keypoints, descriptors = self.orb.detectAndCompute(gray, None)
+        # Mask the board out: it is the most feature-rich thing in view and it
+        # is moved on purpose, so left in it out-votes the background and is
+        # reported as camera drift (239 px on 2026-10-14 after the board was
+        # simply slid across the platform).
+        mask = None
+        if corners is not None and len(corners) >= 4:
+            mask = np.full(gray.shape, 255, np.uint8)
+            hull = cv.convexHull(np.asarray(corners, np.float32).reshape(-1, 1, 2))
+            cv.fillConvexPoly(mask, hull.astype(np.int32), 0)
+            mask = cv.erode(mask, np.ones((121, 121), np.uint8))
+        keypoints, descriptors = self.orb.detectAndCompute(gray, mask)
         drift = None
         reference = self.drift_reference.get(serial)
         if reference is None:
@@ -1280,7 +1290,11 @@ class App:
             if state.drift >= DRIFT_PX:
                 faults.append(f"MOVED {state.drift:.1f} px")
             rows[serial] = faults
-            blocking += faults
+            # With reused intrinsics (--intrinsics-from) refocusing would void
+            # them, so a soft BOARD reading -- usually a board seen nearly
+            # edge-on, whose foreshortened edges read soft -- only warns.
+            blocking += [f for f in faults
+                         if not (f == "BOARD OUT OF FOCUS" and self.args.intrinsics_from)]
         return rows, not blocking
 
     def start_capture(self, force=False):
@@ -1383,7 +1397,12 @@ class App:
                                   f"{s[-4:]} {rows[s][0]}" for s in rows if rows[s]))
         self.progress_label.configure(fg=GOOD if ready else BAD)
         first = next((v[0] for v in rows.values() if v), None)
-        self.status_var.set(FIX.get(first.split()[0], "") if first else
+        advice = FIX.get(first.split()[0], "") if first else ""
+        if first == "BOARD OUT OF FOCUS" and self.args.intrinsics_from:
+            advice = ("DO NOT touch the focus ring: the reused intrinsics belong to the "
+                      "current focus. A board seen nearly edge-on reads soft; move it a "
+                      "little or go ahead -- this warning does not block the start.")
+        self.status_var.set(advice if first else
                             "All four cameras pass. Nothing is recorded until you press "
                             "START CALIBRATION.")
         self.bar.configure(value=100.0 * sum(not v for v in rows.values()) / max(len(rows), 1))

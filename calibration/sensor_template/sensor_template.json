@@ -1,0 +1,86 @@
+{
+  "schema": "sensor-template/1",
+  "units": "millimetre",
+  "family": "36h11",
+  "opencv_dictionary": "DICT_APRILTAG_36h11",
+  "black_bits": 8,
+  "tag_black_mm": [
+    12.0,
+    15.0
+  ],
+  "tag_total_mm": [
+    15.0,
+    18.75
+  ],
+  "tag_ids": {
+    "0": "R1C1",
+    "1": "R1C16",
+    "2": "R16C16",
+    "3": "R16C1"
+  },
+  "placement": "each tag diagonally outside its corner of the active area, edges parallel to the array, inner corner (nearest the centre of the four tags) on the active-area corner; all four at the same offset if not exactly on the corners",
+  "array": {
+    "cells": 16,
+    "pitch_mm": 7.5,
+    "pad_mm": 5.0,
+    "active_side_mm": 120.0,
+    "frame": "u along C1->C16, v along R1->R16, origin at the outer corner of R1C1; u x v points into the sensor (-z of the calibrated world)"
+  },
+  "test_points": [
+    {
+      "name": "P1",
+      "u_mm": 56.25,
+      "v_mm": 56.25,
+      "note": "pad centre R8C8 (single-cell tests T2-T4)"
+    },
+    {
+      "name": "P2",
+      "u_mm": 60.0,
+      "v_mm": 56.25,
+      "note": "gap between R8C8 and R8C9"
+    },
+    {
+      "name": "P3",
+      "u_mm": 60.0,
+      "v_mm": 60.0,
+      "note": "4-pad gap intersection, array centre"
+    },
+    {
+      "name": "P4",
+      "u_mm": 26.25,
+      "v_mm": 26.25,
+      "note": "pad centre R4C4"
+    },
+    {
+      "name": "P5",
+      "u_mm": 93.75,
+      "v_mm": 26.25,
+      "note": "pad centre R4C13"
+    },
+    {
+      "name": "P6",
+      "u_mm": 26.25,
+      "v_mm": 93.75,
+      "note": "pad centre R13C4"
+    },
+    {
+      "name": "P7",
+      "u_mm": 93.75,
+      "v_mm": 93.75,
+      "note": "pad centre R13C13"
+    },
+    {
+      "name": "P8",
+      "u_mm": 56.25,
+      "v_mm": 3.75,
+      "note": "edge pad R1C8"
+    },
+    {
+      "name": "P9",
+      "u_mm": 3.75,
+      "v_mm": 3.75,
+      "note": "corner pad R1C1"
+    }
+  ],
+  "print_note": "print at 100%; check the 100 mm scale bar and the tag black squares with callipers"
+}

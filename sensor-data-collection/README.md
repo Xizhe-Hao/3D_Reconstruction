@@ -182,6 +182,25 @@ Review the printed `score`, `confidence`, and `peak_margin`. Prefer
 The experiment is complete when force import finishes without an error and
 prints its alignment score.
 
+#### Faster, press-by-press alternative
+
+`align_force_curve_only.py` searches by brute force and takes many minutes on a
+10-minute run. `align_force_presses.py` does the same job in about a second and
+labels every tactile frame:
+
+```powershell
+python align_force_presses.py "path\to\session" "path\to\force.csv"
+```
+
+It finds the time scale and offset with an FFT cross-correlation (the export's
+`Time` column is not real time: it ran 5 % slow on 2026-10-12 and 17 % slow on
+2026-10-09), then pairs every press and warps the clock through the contact
+moments, which also absorbs drift that is not a straight line. It subtracts an
+untared force offset, cuts a capture that stalled (no frame for > 1 s), and
+writes `<session>/force_alignment/frames.csv` (per frame: load, distance,
+indentation from contact, press number, loading/hold/unloading) with
+`alignment.json` and `alignment.png`.
+
 ### 2.4 Quick Verification
 
 To check the synchronized videos, sensor, and force data, run:
@@ -338,7 +357,33 @@ Drag with the mouse to orbit at any time. It shares `--mode`, `--gain`,
 `--range`, `--rot90`, `--flip-ud`, and `--flip-lr` with the 2D tool, and imports
 the serial protocol from `live_sensor_2d.py`, so keep the two files together.
 
-### 3.3 `livesensor_view.py` — Minimal ADC Heatmap
+### 3.3 `bench_quicklook.py` — Check a Bench Run
+
+Runs captured with `--no-save-images` have no MP4s for the replay tools.
+This reads `sensor_raw.csv` and the raw IntelliMESUR export in `<session>/force/`,
+plots the tactile response, the load/distance curve and the peak contact map,
+and warns about a wrong frame rate, dropped frames, an untared or out-of-calibration
+force sensor, and a baseline that did not come back.
+
+```powershell
+python bench_quicklook.py <capture session folder>     # writes <session>/bench_quicklook.png
+python bench_quicklook.py --selftest
+```
+
+### 3.4 `bench_report.py` — Quantify an Aligned Run
+
+After `align_force_presses.py`, this turns the run into numbers and two report
+pages in `<session>/report/`: the force / crosshead / tactile timeline, drift of
+the tactile response at the same depth from cycle to cycle (absolute and in %,
+next to the force), the change during every hold, calibration curves per cycle,
+a held-out force prediction with its error by phase and depth, and 2D maps
+(depth × cycle, one colour scale) with 3D bars and row/column sums.
+
+```powershell
+python bench_report.py <capture session folder>
+```
+
+### 3.5 `livesensor_view.py` — Minimal ADC Heatmap
 
 A smaller viewer that plots the raw 8-bit ADC map with no baseline handling.
 Use it to confirm the serial link and firmware are alive:

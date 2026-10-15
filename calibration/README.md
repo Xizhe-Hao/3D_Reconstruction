@@ -18,6 +18,9 @@ calibrate.py      -> calibration.json (intrinsics, extrinsics, world frame)
 validate.py       -> PASS/WARN/FAIL table + metric error in millimetres
 inspect_calib.py  -> look at the error instead of reading it: re-projection,
                      epipolar lines, and the rig in 3D
+make_sensor_template.py -> sensor_template/: corner AprilTags (tag36h11, ID 0-3 =
+                     R1C1, R1C16, R16C16, R16C1) + a 1:1 layout sheet with the
+                     bench-test press points; replaces the black corner tapes
 ```
 
 The capture-side tools (`capture_gui`, `pose_helper`, `tune_exposure`,
