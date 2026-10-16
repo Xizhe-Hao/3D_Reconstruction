@@ -1,0 +1,57 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>传感器表面 · 交互检查</title>
+<style>@font-face{font-family:SurfaceChinese;src:url(surface-font.woff2)}*{box-sizing:border-box}body{margin:0;background:#101723;color:#e4eef8;font:15px/1.5 SurfaceChinese,system-ui}header{padding:14px 20px;background:#182637}h1{font-size:21px;margin:0 0 10px}.controls{display:flex;gap:12px;flex-wrap:wrap;align-items:center}button,select{font-family:inherit;background:#273e54;color:white;border:1px solid #618096;padding:7px;border-radius:5px;cursor:pointer}a{color:#65dfd0}input{vertical-align:middle;max-width:120px}#status{padding:8px 20px;color:#7ee4d6}canvas{width:100%;height:65vh;min-height:360px;display:block;touch-action:none;background:#0c1420}footer{padding:12px 20px}#error{color:#ffad99}details img{max-width:100%;background:white}.key{display:inline-block;width:14px;height:14px;margin-right:5px}#tip{color:#b8c9da}#comparison{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(320px,1fr);gap:8px}#comparison canvas{height:68vh}#images{padding:10px;background:#172334;height:68vh;overflow:auto}#photos{display:grid;grid-template-columns:1fr 1fr;gap:8px}figure{margin:0}figure img{width:100%;display:block;cursor:zoom-in}figcaption{font-size:13px;color:#b9cde0}#timeline{width:240px;max-width:40vw}#photoDialog{background:#101723;color:white;border:1px solid #618096;max-width:96vw}#photoDialog img{max-width:90vw;max-height:83vh}#photoDialog::backdrop{background:#000b}@media(max-width:800px){#comparison{grid-template-columns:1fr}#comparison canvas{height:52vh;min-height:300px}#images{height:auto;max-height:none}} </style>
+<header><h1>AprilTag 区域表面检查</h1><div class="controls"><label>帧 <select id="frame"><option>0</option><option>200</option><option>435</option><option selected>500</option><option>800</option></select></label><button id="prev">上一帧</button><button id="play">播放</button><label>速度 <select id="speed" aria-label="播放速度"><option value="1">1×</option><option value="2">2×</option><option value="4">4×</option><option value="8">8×</option></select></label><button id="next">下一帧</button><input id="timeline" type="range" min="0" max="870" value="500"><label>显示 <select id="mode"><option value="source">来源：观测 / 估计</option><option value="depth">形变热图</option></select></label><label><input id="estimated" type="checkbox" checked>显示插值估计</label><label>高度放大 <input id="gain" type="range" min="1" max="5" step="0.5" value="1"><span id="gainText">1×</span></label><button id="oblique">斜视</button><button id="top">俯视</button><button id="side">侧视</button><button id="reset">重置</button><a href="index.html">实验报告</a><a id="download" download>下载 PLY</a></div></header>
+<div id="status">正在载入表面…</div><div id="error"></div><main id="comparison"><canvas id="view" aria-label="可旋转的传感器表面"></canvas><aside id="images"><strong>同一时间点的视频帧</strong><p id="imageTime">载入中…</p><div id="photos"></div><p>点击图像可放大。RGB 按重建时间点对应；D455 显示实际同步时差。</p></aside></main><dialog id="photoDialog"><button id="closePhoto">关闭</button><br><img id="largePhoto" alt="放大视频帧"></dialog><footer><div><span class="key" style="background:#41c3d7"></span>候选观测 <span class="key" style="background:#f59b32"></span>插值估计；空白表示未恢复。形变热图：蓝 → 黄 → 红 = 下沉增加（0–15mm）。</div><div id="tip">拖动旋转 · 滚轮缩放 · Shift / 右键拖动平移 · 手机单指旋转、双指缩放。默认显示完整表面，可切换俯视和侧视。坐标单位 mm，高度放大仅改变显示。</div><p>当前是全部帧的基线处理结果，去棒仍为启发式规则；橙色区域是估计，不能视为实测真值。</p><details><summary>如果交互视图无法显示，查看静态对比图</summary><img src="surface_experiment.png" alt="观测与补全表面对比"></details></footer>
+<script>
+'use strict';
+const $=s=>document.querySelector(s),canvas=$('#view'),ctx=canvas.getContext('2d');
+let manifest=null,playing=false,playTimer=null,playWall=0,playTime=0;
+let data=null,yaw=-0.45,tilt=0.85,zoom=1,pan=[0,0],drag=null,request=0;
+const params=new URLSearchParams(location.search),match=(params.get('file')||'').match(/frame_(\d+)/);const requestedFrame=match?+match[1]:500;
+function reset(kind='oblique'){yaw=kind==='side'?0:-0.45;tilt=kind==='top'?0:kind==='side'?1.5:0.85;zoom=1;pan=[0,0];draw()}
+function visible(r,c){return data.valid[r][c]&&(data.observed[r][c]||($('#estimated').checked&&data.inferred[r][c]))}
+function draw(){
+ if(!ctx||!data)return;const dpr=Math.min(devicePixelRatio||1,2),w=canvas.clientWidth,h=canvas.clientHeight;canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);
+ const gain=+$('#gain').value;$('#gainText').textContent=gain+'×';const scale=Math.min(w,h)*.007*zoom,rows=data.shape[0],cols=data.shape[1];
+ function project(u,v,z){const x=Math.cos(yaw)*u-Math.sin(yaw)*v,y=Math.sin(yaw)*u+Math.cos(yaw)*v;return [w/2+pan[0]+x*scale,h/2+pan[1]+(Math.cos(tilt)*y-Math.sin(tilt)*z*gain)*scale,Math.sin(tilt)*y+Math.cos(tilt)*z*gain]}
+ function line(a,b,color){ctx.strokeStyle=color;ctx.beginPath();ctx.moveTo(a[0],a[1]);ctx.lineTo(b[0],b[1]);ctx.stroke()}
+ for(let i=-50;i<=50;i+=10){line(project(i,-50,0),project(i,50,0),'#25374b');line(project(-50,i,0),project(50,i,0),'#25374b')}
+ const pts=data.uv.map((row,r)=>row.map((uv,c)=>project(uv[0],uv[1],data.height[r][c]))),tri=[];
+ for(let r=0;r<rows-1;r++)for(let c=0;c<cols-1;c++)for(const ids of [[[r,c],[r+1,c],[r,c+1]],[[r+1,c],[r+1,c+1],[r,c+1]]]){
+ if(!ids.every(([i,j])=>visible(i,j)))continue;const p=ids.map(([i,j])=>pts[i][j]);const est=ids.some(([i,j])=>data.inferred[i][j]);let color=est?'#f59b32':'#41c3d7';
+ if($('#mode').value==='depth'){const depth=ids.reduce((s,[i,j])=>s+data.depression[i][j],0)/3;const t=Math.max(0,Math.min(1,depth/15));color=`hsl(${230*(1-t)},85%,58%)`}
+ tri.push({p,z:p.reduce((s,a)=>s+a[2],0)/3,color,est})}
+ tri.sort((a,b)=>a.z-b.z);for(const t of tri){ctx.beginPath();ctx.moveTo(...t.p[0].slice(0,2));ctx.lineTo(...t.p[1].slice(0,2));ctx.lineTo(...t.p[2].slice(0,2));ctx.closePath();ctx.fillStyle=t.color;ctx.fill();ctx.strokeStyle=t.color;ctx.lineWidth=.4;ctx.stroke()}
+ for(let r=0;r<rows;r++)for(let c=0;c<cols;c++)if(visible(r,c)){const p=pts[r][c];ctx.fillStyle=data.inferred[r][c]?'#ffba64':'#91e5ef';ctx.fillRect(p[0]-1,p[1]-1,2,2)}
+ const origin=project(-50,-50,0);for(const [p,label,color] of [[project(-25,-50,0),'u / 列','#ff8d90'],[project(-50,-25,0),'v / 行','#9be99e'],[project(-50,-50,10),'高度','#c5b6ff']]){line(origin,p,color);ctx.fillStyle=color;ctx.font='13px SurfaceChinese,system-ui';ctx.fillText(label,p[0]+4,p[1])}
+ ctx.fillStyle='#b9cde0';ctx.font='13px SurfaceChinese,system-ui';ctx.fillText('参考网格 10 mm · 原始比例 '+gain+'× 高度',14,h-16);
+}
+async function load(){const id=++request,frame=+$('#frame').value,stem='frame_'+String(frame).padStart(5,'0');$('#status').textContent='正在载入第 '+frame+' 帧…';$('#error').textContent='';try{const response=await fetch(stem+'.json',{cache:'no-store'});if(!response.ok)throw Error('HTTP '+response.status);const next=await response.json();if(id!==request)return;data=next;let obs=0,est=0;data.observed.flat().forEach(v=>obs+=+v);data.inferred.flat().forEach(v=>est+=+v);$('#status').textContent=`第 ${frame} 帧 · 观测 ${obs} 格 · 估计 ${est} 格 · 已载入，可拖动旋转`;$('#download').href=stem+'_display.ply';$('#timeline').value=frame;
+ $('#imageTime').textContent=`帧 ${frame} · 时间 ${data.time_s.toFixed(3)} s · D455 时差 ${data.d455_dt_ms.toFixed(2)} ms`+(data.d455_excluded?'（本帧未参与表面融合）':'');
+ $('#photos').replaceChildren();for(const [file,title] of [['rgb_0.jpg','RGB 相机 0'],['rgb_1.jpg','RGB 相机 1'],['rgb_2.jpg','RGB 相机 2'],['rgb_3.jpg','RGB 相机 3'],['d455_rgb.jpg','D455 彩色帧']]){const figure=document.createElement('figure'),img=document.createElement('img'),caption=document.createElement('figcaption');img.src='../frames/'+String(frame).padStart(5,'0')+'/'+file;img.alt=title+' 帧 '+frame;img.onclick=()=>{$('#largePhoto').src=img.src;$('#photoDialog').showModal()};caption.textContent=title;figure.append(img,caption);$('#photos').append(figure)}draw();if(playing)schedulePlayback()}catch(e){stop();$('#status').textContent='表面载入失败';$('#error').textContent=e.message+'。请打开下方静态对比图。'}}
+function stop(){playing=false;clearTimeout(playTimer);$('#play').textContent='播放'}
+ function startPlayback(){if(!data||!manifest)return;clearTimeout(playTimer);playing=true;playWall=performance.now();playTime=data.time_s;$('#play').textContent='暂停';schedulePlayback()}
+ function schedulePlayback(){
+  clearTimeout(playTimer);if(!playing)return;
+  const speed=+$('#speed').value,frames=manifest.frames,current=frames.findIndex(f=>f.frame===data.frame);
+  if(current>=frames.length-1){stop();return}
+  const due=playWall+(frames[current+1].time_s-playTime)*1000/speed;
+  playTimer=setTimeout(()=>{
+   if(!playing)return;
+   const target=playTime+(performance.now()-playWall)*speed/1000;
+   let index=current+1;while(index+1<frames.length&&frames[index+1].time_s<=target)index++;
+   selectFrame(frames[index].frame);
+  },Math.max(16,due-performance.now()));
+ }
+ $('#speed').onchange=()=>{if(playing)startPlayback()};
+ function selectFrame(frame){$('#frame').value=frame;load()}
+ function advance(delta){if(!manifest)return;const frames=manifest.frames.map(f=>f.frame),i=frames.indexOf(+$('#frame').value),j=i+delta;if(j<0||j>=frames.length){stop();return}selectFrame(frames[j])}
+ $('#frame').onchange=()=>{stop();load()};$('#prev').onclick=()=>{stop();advance(-1)};$('#next').onclick=()=>{stop();advance(1)};$('#play').onclick=()=>{if(playing)stop();else startPlayback()};$('#timeline').oninput=()=>{stop();selectFrame(+$('#timeline').value)};$('#closePhoto').onclick=()=>$('#photoDialog').close();
+for(const id of ['mode','estimated','gain'])$('#'+id).oninput=draw;for(const id of ['top','side','oblique','reset'])$('#'+id).onclick=()=>reset(id==='reset'?'oblique':id);
+canvas.oncontextmenu=e=>e.preventDefault();const pointers=new Map();let pinch=null;
+canvas.onpointerdown=e=>{canvas.setPointerCapture(e.pointerId);pointers.set(e.pointerId,[e.clientX,e.clientY]);drag={x:e.clientX,y:e.clientY,pan:e.shiftKey||e.button===2};pinch=null};
+canvas.onpointermove=e=>{if(!pointers.has(e.pointerId))return;pointers.set(e.pointerId,[e.clientX,e.clientY]);if(pointers.size===2){const [a,b]=[...pointers.values()],dist=Math.hypot(a[0]-b[0],a[1]-b[1]);if(pinch)zoom=Math.max(.2,Math.min(8,zoom*dist/pinch));pinch=dist;draw();return}if(!drag)return;const dx=e.clientX-drag.x,dy=e.clientY-drag.y;if(drag.pan){pan[0]+=dx;pan[1]+=dy}else{yaw+=dx*.009;tilt=Math.max(-1.55,Math.min(1.55,tilt+dy*.009))}drag.x=e.clientX;drag.y=e.clientY;draw()};
+canvas.onpointerup=canvas.onpointercancel=e=>{pointers.delete(e.pointerId);pinch=null;drag=null};canvas.addEventListener('wheel',e=>{e.preventDefault();zoom=Math.max(.2,Math.min(8,zoom*Math.exp(-e.deltaY*.001)));draw()},{passive:false});window.addEventListener('resize',draw);
+ async function init(){try{const r=await fetch('manifest.json',{cache:'no-store'});if(!r.ok)throw Error('manifest HTTP '+r.status);manifest=await r.json();$('#frame').replaceChildren();for(const f of manifest.frames){const option=document.createElement('option');option.value=f.frame;option.textContent=f.frame;$('#frame').append(option)}$('#timeline').min=manifest.frames[0].frame;$('#timeline').max=manifest.frames.at(-1).frame;$('#frame').value=manifest.frames.some(f=>f.frame===requestedFrame)?requestedFrame:manifest.frames[0].frame;load()}catch(e){$('#error').textContent='序列索引载入失败：'+e.message}}
+ init();
+</script></html>

@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>三维重建 · PLY 查看器</title>
+<style>body{margin:0;background:#101723;color:#dae7f5;font:15px system-ui}header{padding:18px 24px;display:flex;align-items:center;gap:20px;flex-wrap:wrap}h1{font-size:20px;margin:0}button,input{accent-color:#56cbb9}button{padding:8px 16px;cursor:pointer}canvas{display:block;width:100%;height:calc(100vh - 160px);touch-action:none}footer{padding:12px 24px;color:#a4bbce}#status{padding:0 24px;color:#56cbb9}</style>
+<header><h1>三维重建 / PLY</h1><input id="file" type="file" accept=".ply"><label>点大小 <input id="size" type="range" min="1" max="8" value="2"></label><button id="reset">重置视角</button></header>
+<div id="status">尚未载入重建结果。请选择 PLY 文件（在浏览器本地读取）。</div><canvas id="view"></canvas>
+<footer>拖动：环绕旋转 · Shift + 拖动 / 右键：平移 · 滚轮：缩放。支持 ASCII / binary little-endian PLY 的顶点及 RGB；网格以顶点显示。</footer>
+<script>
+'use strict';
+function parsePLY(buffer){
+ const bytes=new Uint8Array(buffer),decoder=new TextDecoder();
+ let end=-1;
+ for(let i=0;i<Math.min(bytes.length,1048576)-10;i++)if((i===0||bytes[i-1]===10)&&decoder.decode(bytes.subarray(i,i+10))==='end_header'){
+  let j=i+10;if(bytes[j]===13)j++;if(bytes[j]!==10)continue;end=j+1;break;
+ }
+ if(end<0)throw Error('找不到 PLY 文件头');
+ const lines=decoder.decode(bytes.subarray(0,end)).trim().split(/\r?\n/);
+ if(lines[0]!=='ply')throw Error('不是 PLY 文件');
+ let format='',count=0,active=false,seen=false,props=[];
+ const types={char:['getInt8',1],int8:['getInt8',1],uchar:['getUint8',1],uint8:['getUint8',1],short:['getInt16',2],int16:['getInt16',2],ushort:['getUint16',2],uint16:['getUint16',2],int:['getInt32',4],int32:['getInt32',4],uint:['getUint32',4],uint32:['getUint32',4],float:['getFloat32',4],float32:['getFloat32',4],double:['getFloat64',8],float64:['getFloat64',8]};
+ for(const line of lines){const p=line.trim().split(/\s+/);
+  if(p[0]==='format')format=p[1];
+  if(p[0]==='element'){active=p[1]==='vertex';if(!seen&&!active&&Number(p[2])>0)throw Error('vertex 必须是第一个非空元素');if(active){count=Number(p[2]);seen=true;}}
+  if(p[0]==='property'&&active){if(!types[p[1]])throw Error('不支持的顶点属性类型');props.push({name:p[2],type:types[p[1]]});}
+ }
+ if(!['ascii','binary_little_endian'].includes(format))throw Error('不支持该 PLY 编码');
+ if(!Number.isSafeInteger(count)||count<=0||count>10000000)throw Error('顶点数必须为 1 至 1000 万');
+ const indices=['x','y','z'].map(n=>props.findIndex(p=>p.name===n));if(indices.includes(-1))throw Error('缺少 XYZ 坐标');
+ const colors=['red','green','blue'].map(n=>props.findIndex(p=>p.name===n));
+ const data=new Float32Array(count*6),lo=[Infinity,Infinity,Infinity],hi=[-Infinity,-Infinity,-Infinity];
+ const rows=format==='ascii'?decoder.decode(bytes.subarray(end)).trim().split(/\r?\n/):null,view=new DataView(buffer);let offset=end,n=0;
+ for(let i=0;i<count;i++){
+  const values=rows?(rows[i]||'').trim().split(/\s+/).map(Number):props.map(p=>{const v=view[p.type[0]](offset,true);offset+=p.type[1];return v;});
+  if(values.length<props.length)throw Error('PLY 数据不完整');
+  const xyz=indices.map(k=>values[k]);if(!xyz.every(Number.isFinite))continue;
+  for(let k=0;k<3;k++){data[n*6+k]=xyz[k];lo[k]=Math.min(lo[k],xyz[k]);hi[k]=Math.max(hi[k],xyz[k]);data[n*6+3+k]=colors[k]<0?0.75:Math.max(0,Math.min(1,values[colors[k]]/255));}n++;
+ }
+ if(!n)throw Error('没有有效顶点');
+ const span=Math.max(...hi.map((v,k)=>v-lo[k]))||1;
+ for(let i=0;i<n;i++)for(let k=0;k<3;k++)data[i*6+k]=(data[i*6+k]-(lo[k]+hi[k])/2)/span*2;
+ return {data:data.subarray(0,n*6),count:n,span};
+}
+const canvas=document.querySelector('#view'),status=document.querySelector('#status'),gl=canvas.getContext('webgl');
+let yaw=0,pitch=0,zoom=1,panX=0,panY=0,count=0;
+function reset(){yaw=-0.5;pitch=0.6;zoom=1;panX=panY=0;draw();}
+let program;
+if(!gl){status.textContent='浏览器不支持 WebGL，请启用硬件加速。';}else{
+ function shader(type,source){const s=gl.createShader(type);gl.shaderSource(s,source);gl.compileShader(s);if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw Error(gl.getShaderInfoLog(s));return s;}
+ program=gl.createProgram();
+ gl.attachShader(program,shader(gl.VERTEX_SHADER,`attribute vec3 position;attribute vec3 color;varying vec3 rgb;uniform vec4 camera;uniform vec3 viewport;uniform vec2 pan;void main(){float a=camera.x,b=camera.y;vec3 p=vec3(cos(a)*position.x-sin(a)*position.y,sin(a)*position.x+cos(a)*position.y,position.z);p=vec3(p.x,cos(b)*p.y-sin(b)*p.z,sin(b)*p.y+cos(b)*p.z);float d=4.0+p.y;gl_Position=vec4(p.x*camera.z/viewport.x+pan.x*d,p.z*camera.z+pan.y*d,0.2*p.y,d);gl_PointSize=camera.w;rgb=color;}`));
+ gl.attachShader(program,shader(gl.FRAGMENT_SHADER,`precision mediump float;varying vec3 rgb;void main(){if(length(gl_PointCoord-vec2(0.5))>0.5)discard;gl_FragColor=vec4(rgb,1.0);}`));
+ gl.linkProgram(program);if(!gl.getProgramParameter(program,gl.LINK_STATUS))throw Error(gl.getProgramInfoLog(program));gl.useProgram(program);
+ gl.bindBuffer(gl.ARRAY_BUFFER,gl.createBuffer());
+ for(const [name,offset] of [['position',0],['color',12]]){let loc=gl.getAttribLocation(program,name);gl.enableVertexAttribArray(loc);gl.vertexAttribPointer(loc,3,gl.FLOAT,false,24,offset);}
+ gl.enable(gl.DEPTH_TEST);gl.clearColor(0.035,0.055,0.085,1);
+}
+function draw(){if(!gl)return;const dpr=Math.min(devicePixelRatio,2);canvas.width=canvas.clientWidth*dpr;canvas.height=canvas.clientHeight*dpr;gl.viewport(0,0,canvas.width,canvas.height);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);gl.uniform4f(gl.getUniformLocation(program,'camera'),yaw,pitch,zoom*2,Number(document.querySelector('#size').value)*dpr);gl.uniform3f(gl.getUniformLocation(program,'viewport'),canvas.width/canvas.height,0,0);gl.uniform2f(gl.getUniformLocation(program,'pan'),panX,panY);gl.drawArrays(gl.POINTS,0,count);}
+document.querySelector('#file').onchange=async e=>{const file=e.target.files[0];if(!file||!gl)return;status.textContent='正在载入…';try{if(file.size>512*1024*1024)throw Error('请选择小于 512 MB 的文件');const cloud=parsePLY(await file.arrayBuffer());gl.bufferData(gl.ARRAY_BUFFER,cloud.data,gl.STATIC_DRAW);count=cloud.count;reset();status.textContent=`${file.name} · ${count.toLocaleString()} 点 · 最大轴跨度 ${cloud.span.toPrecision(5)}（原文件单位）`;}catch(error){count=0;draw();status.textContent='载入失败：'+error.message;}};
+let drag=null;canvas.oncontextmenu=e=>e.preventDefault();canvas.onpointerdown=e=>{canvas.setPointerCapture(e.pointerId);drag={x:e.clientX,y:e.clientY,pan:e.shiftKey||e.button===2};};canvas.onpointermove=e=>{if(!drag)return;let dx=e.clientX-drag.x,dy=e.clientY-drag.y;if(drag.pan){panX+=2*dx/canvas.clientWidth;panY-=2*dy/canvas.clientHeight;}else{yaw+=dx*0.008;pitch=Math.max(-1.55,Math.min(1.55,pitch+dy*0.008));}drag.x=e.clientX;drag.y=e.clientY;draw();};canvas.onpointerup=canvas.onpointercancel=()=>drag=null;canvas.addEventListener('wheel',e=>{e.preventDefault();zoom=Math.max(0.05,Math.min(30,zoom*Math.exp(-e.deltaY*0.001)));draw();},{passive:false});document.querySelector('#reset').onclick=reset;document.querySelector('#size').oninput=draw;window.onresize=draw;reset();
+</script></html>
