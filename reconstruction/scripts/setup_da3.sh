@@ -25,10 +25,14 @@ import sys
 from pathlib import Path
 root = Path.cwd()
 todo = []
+# Packages with no wheel for this host, e.g. open3d (DA3 benchmarks only) needs glibc 2.35 but RHEL 9 has 2.34.
+skip = {n.strip().lower() for n in os.environ.get('DA3_SKIP_PACKAGES', '').split(',') if n.strip()}
 for line in (root / 'scripts/requirements_da3.lock').read_text().splitlines():
     if not line or line.startswith('#'):
         continue
     name, version = line.split('==')
+    if name.lower() in skip:
+        continue
     try:
         dist = metadata.distribution(name)
         matches = dist.version == version

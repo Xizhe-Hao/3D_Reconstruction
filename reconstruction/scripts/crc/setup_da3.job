@@ -1,0 +1,19 @@
+#!/bin/bash
+# Build .venv-da3 and fetch DA3-GIANT on a CPU node (installs need no GPU).
+# Submit from reconstruction/:  qsub scripts/crc/setup_da3.job
+#$ -q long
+#$ -pe smp 4
+#$ -N da3_setup
+#$ -cwd
+#$ -j y
+#$ -o logs/$JOB_NAME.$JOB_ID.log
+set -euo pipefail
+export PATH=$HOME/.local/bin:$PATH
+command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+uv python install 3.12
+export DA3_BASE_PYTHON=$(uv python find 3.12)
+export DA3_PIP_INDEX=https://pypi.org/simple
+# CRC nodes are RHEL 9 (glibc 2.34); open3d 0.20 wheels need 2.35 and only DA3's benchmark code imports it.
+export DA3_SKIP_PACKAGES=open3d
+bash scripts/setup_da3.sh
+.venv-da3/bin/python -c "import torch, cv2, depth_anything_3; print('torch', torch.__version__, 'cuda', torch.version.cuda)"

@@ -1,0 +1,19 @@
+#!/bin/bash
+# Reconstruct the active frames of a session, split into CHUNKS array tasks, one A10 each.
+# Needs <session>/active_segments.json from scripts/find_active_segments.py.
+# Submit from reconstruction/:
+#   qsub -t 1-8 -tc 4 -v SESSION=data/<session>,RES=1344,CHUNKS=8,OUT=outputs/<name> scripts/crc/rgbd_array.job
+# -t must equal 1-CHUNKS; -tc 4 matches the @crc_gpu quota. Finished frames are skipped on resubmission.
+#$ -q gpu@@crc_a10
+#$ -l gpu_card=1
+#$ -pe smp 8
+#$ -N rgbd
+#$ -cwd
+#$ -j y
+#$ -o logs/$JOB_NAME.$JOB_ID.$TASK_ID.log
+set -euo pipefail
+export HF_HOME=$PWD/.cache/huggingface PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+FRAMES=$(.venv-da3/bin/python scripts/find_active_segments.py --session "$SESSION" --print-chunk "$SGE_TASK_ID/$CHUNKS")
+echo "task $SGE_TASK_ID/$CHUNKS on $(hostname) GPU ${CUDA_VISIBLE_DEVICES:-unset}: frames ${FRAMES%%,*}..${FRAMES##*,}"
+.venv-da3/bin/python scripts/reconstruct_rgbd_web.py --session "$SESSION" \
+  --output "$OUT/frames" --resolution "$RES" --frames "$FRAMES"

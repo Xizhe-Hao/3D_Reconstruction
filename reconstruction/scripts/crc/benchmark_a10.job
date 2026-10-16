@@ -1,0 +1,18 @@
+#!/bin/bash
+# Time one frame per resolution on one A10 before launching the full run.
+# Submit from reconstruction/:  qsub -v SESSION=data/<session> scripts/crc/benchmark_a10.job
+#$ -q gpu@@crc_a10
+#$ -l gpu_card=1
+#$ -pe smp 8
+#$ -N da3_bench
+#$ -cwd
+#$ -j y
+#$ -o logs/$JOB_NAME.$JOB_ID.log
+set -uo pipefail
+export HF_HOME=$PWD/.cache/huggingface PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
+for R in ${RESOLUTIONS:-1344 1512}; do
+  .venv-da3/bin/python scripts/reconstruct_rgbd_web.py --session "$SESSION" \
+    --output outputs/bench_a10 --resolution "$R" --frames "${FRAME:-60}" --benchmark || echo "resolution $R failed"
+done
+cat outputs/bench_a10/benchmark_*.json
