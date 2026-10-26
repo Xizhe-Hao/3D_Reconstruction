@@ -58,6 +58,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-pair-s", type=float, default=3.0, help="pairing window after the coarse map")
     p.add_argument("--baseline-s", type=float, default=5.0, help="unloaded seconds at the start")
     p.add_argument("--warp", choices=["piecewise", "linear"], default="piecewise")
+    p.add_argument("--clock", type=float, nargs=2, default=None, metavar=("SCALE", "OFFSET"),
+                   help="skip the search: tactile_t = SCALE * force_t + OFFSET (e.g. from matched step edges)")
     p.add_argument("--out", type=Path, default=None)
     return p.parse_args()
 
@@ -182,6 +184,9 @@ def fit_warp(t, total, ft, load, coarse, tactile_onset, args, warnings):
     _, scale, offset = coarse
     tp = press_onsets(total, t, tactile_onset, args.min_press_s)
     fp = press_onsets(load, ft, args.force_onset, args.min_press_s)
+    linear = np.array([[0.0, offset], [ft[-1], scale * ft[-1] + offset]])
+    if args.clock:
+        return scale, offset, linear, np.zeros((0, 2)), np.zeros(0), fp
     t_on = np.array([p[0] for p in tp])
     pairs, used = [], set()
     for f_on, a, b in fp:
@@ -199,7 +204,7 @@ def fit_warp(t, total, ft, load, coarse, tactile_onset, args, warnings):
                         "tactile recording found no tactile partner")
     if len(pairs) < 2:
         warnings.append("fewer than 2 paired presses; keeping the coarse mapping")
-        return scale, offset, np.array([[0.0, offset]]), pairs, np.zeros(0), fp
+        return scale, offset, linear, pairs, np.zeros(0), fp
     (lin_scale, lin_off), *_ = np.linalg.lstsq(np.c_[pairs[:, 0], np.ones(len(pairs))], pairs[:, 1], rcond=None)
     residual = pairs[:, 1] - (lin_scale * pairs[:, 0] + lin_off)
     if args.warp == "linear":
@@ -279,7 +284,7 @@ def main() -> None:
         warnings.append(f"force not tared: {tare:+.1f} N at the start; subtracted before use")
         load = load - tare
 
-    coarse = coarse_alignment(t, total, ft, load, args)
+    coarse = (float("nan"), *args.clock) if args.clock else coarse_alignment(t, total, ft, load, args)
     scale, offset, anchors, pairs, residual, fp = fit_warp(t, total, ft, load, coarse, tactile_onset, args, warnings)
     f_of_t, inside, lab_load, lab_dist, indent, press, phase = label_frames(t, ft, load, dist, anchors, fp, args)
 

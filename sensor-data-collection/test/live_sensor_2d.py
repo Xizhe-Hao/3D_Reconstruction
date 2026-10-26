@@ -14,6 +14,21 @@ Usage:
     python live_sensor_2d.py --simulate           # no hardware, synthetic press
     python live_sensor_2d.py --list-ports         # find the Arduino COM port
     python live_sensor_2d.py --selftest           # headless render check
+    python live_sensor_2d.py --follow E:/tactile_sensor_captures --mode raw
+                                                  # watch a running capture
+
+    python live_sensor_2d.py COM3 --mode raw --record C:/tactile_data/force_cal
+                                                  # show and record, no cameras
+
+--record writes every frame to <root>/capture_<stamp>/sensor_raw.csv in the
+same format as the capture script, so bench_quicklook.py,
+align_force_presses.py and bench_report.py work on it unchanged. Put the
+IntelliMESUR export in <session>/force/ afterwards.
+
+--follow reads the sensor_raw.csv that capture_3blackfly_sensor_force.py is
+writing, so the capture keeps sole ownership of the serial port. Give it a
+session folder, a CSV, or the capture root; with the root it shows the newest
+capture_* session and switches when the next capture starts.
 
 Keys while the window is focused:
     b        re-capture the no-load baseline
@@ -21,6 +36,7 @@ Keys while the window is focused:
     v        toggle per-cell value labels
     + / -    display gain up / down
     ] / [    display range up / down
+    r        reset the held maximum (--mode raw)
     s        save a PNG snapshot
     q / Esc  quit
 
@@ -31,8 +47,10 @@ This tool only reads; it never writes into a capture session.
 from __future__ import annotations
 
 import argparse
+import csv
 import math
 import sys
+import threading
 import time
 from collections import deque
 from datetime import datetime
@@ -51,6 +69,7 @@ HEADER_AFTER_MAGIC = 1 + 1 + 1 + 1 + 4 + 4
 FRAME_BYTES = len(MAGIC) + HEADER_AFTER_MAGIC + PAYLOAD_BYTES + 2
 PING_INTERVAL_S = 0.5  # the firmware heartbeat times out after 2 s
 ADC_MAX = 255.0
+SATURATION_ADC = 250  # raw readings at or above this count as saturated
 
 MODE_COLORMAPS = {
     "change": "RdBu_r",
@@ -135,28 +154,58 @@ class SerialSource:
         self.buffer = bytearray()
         self.last_ping = time.time()
         self.last_index = None
+        self.on_frame = None  # called with every frame, e.g. by --record
+
+        # Reading, the heartbeat and on_frame run on their own thread, so a
+        # window drag, a click or a locked screen that blocks the GUI cannot
+        # starve the firmware's 2 s heartbeat or drop recorded frames. It
+        # starts on the first read_latest(), after on_frame has been set.
+        self.lock = threading.Lock()
+        self.newest = None
+        self.stop_event = threading.Event()
+        self.error = None
+        self.thread = None
+
+    def _reader(self):
+        try:
+            while not self.stop_event.is_set():
+                now = time.time()
+                if now - self.last_ping >= PING_INTERVAL_S:
+                    self.port.write(b"M16_PING\n")
+                    self.last_ping = now
+
+                chunk = self.port.read(4096)
+                if chunk:
+                    self.buffer.extend(chunk)
+
+                for frame_index, millis, grid in parse_frames(self.buffer):
+                    # The firmware sends each frame twice (once before and
+                    # once after the camera trigger); keep the first copy only.
+                    if frame_index == self.last_index:
+                        continue
+                    self.last_index = frame_index
+                    if self.on_frame is not None:
+                        self.on_frame(time.time_ns(), frame_index, millis, grid)
+                    with self.lock:
+                        self.newest = (frame_index, millis, grid)
+        except Exception as exc:
+            if not self.stop_event.is_set():
+                self.error = exc
+                print(f"Sensor reader stopped: {exc}", file=sys.stderr, flush=True)
 
     def read_latest(self):
-        now = time.time()
-        if now - self.last_ping >= PING_INTERVAL_S:
-            self.port.write(b"M16_PING\n")
-            self.last_ping = now
-
-        chunk = self.port.read(4096)
-        if chunk:
-            self.buffer.extend(chunk)
-
-        newest = None
-        for frame_index, millis, grid in parse_frames(self.buffer):
-            # The firmware sends each frame twice (once before and once after
-            # the camera trigger); keep the first copy only.
-            if frame_index == self.last_index:
-                continue
-            self.last_index = frame_index
-            newest = (frame_index, millis, grid)
+        """The newest frame since the last call, or None."""
+        if self.thread is None:
+            self.thread = threading.Thread(target=self._reader, daemon=True)
+            self.thread.start()
+        with self.lock:
+            newest, self.newest = self.newest, None
         return newest
 
     def close(self):
+        self.stop_event.set()
+        if self.thread is not None:
+            self.thread.join(timeout=2.0)
         try:
             self.port.write(b"M16_STOP\n")
             self.port.flush()
@@ -167,6 +216,122 @@ class SerialSource:
         except Exception:
             pass
         print("Stopped; M16_STOP sent.")
+
+
+class SessionRecorder:
+    """Writes every frame to a capture-style session's sensor_raw.csv."""
+
+    def __init__(self, root):
+        self.session = Path(root).expanduser().resolve() / datetime.now().strftime(
+            "capture_%Y%m%d_%H%M%S"
+        )
+        (self.session / "force").mkdir(parents=True)
+        self.handle = (self.session / "sensor_raw.csv").open(
+            "w", newline="", encoding="utf-8"
+        )
+        self.writer = csv.writer(self.handle)
+        self.writer.writerow(
+            ["host_received_ns", "frame_index", "device_millis"]
+            + [f"r{r + 1}c{c + 1}_adc8" for r in range(ROWS) for c in range(COLS)]
+        )
+        self.frames = 0
+        self.dropped = 0
+        self.last_index = None
+        self.last_flush = time.monotonic()
+        print(f"Recording to {self.session}", flush=True)
+
+    def __call__(self, host_ns, frame_index, millis, grid):
+        if self.last_index is not None and frame_index > self.last_index + 1:
+            self.dropped += frame_index - self.last_index - 1
+        self.last_index = frame_index
+        self.writer.writerow([host_ns, frame_index, millis] + grid.ravel().tolist())
+        self.frames += 1
+        now = time.monotonic()
+        if now - self.last_flush >= 1.0:
+            self.last_flush = now
+            self.handle.flush()
+
+    def close(self):
+        self.handle.close()
+        print(
+            f"Recorded {self.frames} frames ({self.dropped} dropped) to "
+            f"{self.session / 'sensor_raw.csv'}\n"
+            f"Put the IntelliMESUR export in {self.session / 'force'}",
+            flush=True,
+        )
+
+
+class CsvFollowSource:
+    """Tails sensor_raw.csv of a running capture instead of opening the port."""
+
+    CHECK_NEWER_S = 2.0
+    FIELDS = 3 + ROWS * COLS  # host_received_ns, frame_index, device_millis, cells
+
+    def __init__(self, path):
+        self.path = Path(path).expanduser()
+        if not self.path.exists():
+            raise FileNotFoundError(f"{self.path} does not exist")
+        self.follow_root = self.path.is_dir() and not (
+            self.path / "sensor_raw.csv"
+        ).exists()
+        self.handle = None
+        self.csv_path = None
+        self.remainder = ""
+        self.last_check = 0.0
+        self.switched = False  # set when a new session is picked up
+        if self.follow_root:
+            print(f"Watching {self.path} for capture_* sessions ...", flush=True)
+        self._open_newest()
+
+    def _newest_csv(self):
+        if self.path.is_file():
+            return self.path
+        if not self.follow_root:
+            return self.path / "sensor_raw.csv"
+        sessions = sorted(
+            candidate
+            for candidate in self.path.glob("capture_*/sensor_raw.csv")
+        )
+        return sessions[-1] if sessions else None
+
+    def _open_newest(self):
+        self.last_check = time.time()
+        newest = self._newest_csv()
+        if newest is None or newest == self.csv_path:
+            return
+        if self.handle is not None:
+            self.handle.close()
+        # Plain reads do not lock the file on Windows, so the capture keeps
+        # writing. Start at the end: only frames from now on are shown.
+        self.handle = newest.open("r", encoding="utf-8", newline="")
+        self.handle.seek(0, 2)
+        self.csv_path = newest
+        self.remainder = ""
+        self.switched = True
+        print(f"Following {newest}", flush=True)
+
+    def read_latest(self):
+        if self.follow_root and time.time() - self.last_check >= self.CHECK_NEWER_S:
+            self._open_newest()
+        if self.handle is None:
+            return None
+        chunk = self.handle.read()
+        if not chunk:
+            return None
+        lines = (self.remainder + chunk).split("\n")
+        self.remainder = lines.pop()  # partial line until the next flush
+        for line in reversed(lines):
+            fields = line.strip().split(",")
+            if len(fields) != self.FIELDS or not fields[1].isdigit():
+                continue
+            grid = np.array(fields[3:], dtype=np.uint8).reshape(ROWS, COLS)
+            return int(fields[1]), int(fields[2]), grid
+        return None
+
+    def close(self):
+        if self.handle is not None:
+            self.handle.close()
+        print("Stopped following the capture.")
 
 
 class SimulatedSource:
@@ -325,12 +490,32 @@ def parse_args(argv=None):
         help="Directory for PNG snapshots.",
     )
     parser.add_argument("--handshake-timeout", type=float, default=10.0)
+    parser.add_argument(
+        "--record",
+        type=Path,
+        metavar="ROOT",
+        help=(
+            "Also save every frame to ROOT/capture_<stamp>/sensor_raw.csv "
+            "(serial port only)."
+        ),
+    )
+    parser.add_argument(
+        "--follow",
+        type=Path,
+        metavar="PATH",
+        help=(
+            "Show a running capture instead of opening the serial port: a "
+            "session folder, its sensor_raw.csv, or the capture root."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.selftest:
         args.simulate = True
-    if not args.list_ports and not args.simulate and not args.port:
-        parser.error("a serial port is required unless --simulate is used")
+    if not (args.list_ports or args.simulate or args.port or args.follow):
+        parser.error("a serial port is required unless --simulate or --follow is used")
+    if args.record and (args.follow or args.simulate or not args.port):
+        parser.error("--record needs a serial port (not --follow or --simulate)")
     if args.baseline_frames < 1:
         parser.error("--baseline-frames must be at least 1")
     if args.gain <= 0:
@@ -368,6 +553,7 @@ class LiveSensor2D:
         self.first_millis = None
         self.trend_times = deque()
         self.trend_values = deque()
+        self.held_max = None  # (value, row, column) since start or last reset
         self.closed = False
 
         if args.mode == "change":
@@ -490,6 +676,15 @@ class LiveSensor2D:
             markeredgecolor="#0b0b0b",
             markeredgewidth=1.6,
         )
+        self.saturation_marker, = self.image_axis.plot(
+            [],
+            [],
+            "s",
+            markersize=11,
+            markerfacecolor="none",
+            markeredgecolor="#e8202a",
+            markeredgewidth=1.8,
+        )
         self.image_title = self.image_axis.set_title(
             "waiting for frames ...", fontsize=10
         )
@@ -517,6 +712,15 @@ class LiveSensor2D:
         self.trend_axis.set_ylabel(self.trend_label())
         self.trend_axis.grid(True, alpha=0.25)
         self.trend_axis.set_title("Signal trend", fontsize=10)
+        if self.args.mode == "raw":
+            self.trend_axis.axhline(
+                SATURATION_ADC, color="#e8202a", linewidth=1.0, linestyle="--"
+            )
+            self.trend_axis.text(
+                0.01, SATURATION_ADC, " saturation", color="#e8202a",
+                fontsize=8, va="bottom",
+                transform=self.trend_axis.get_yaxis_transform(),
+            )
 
         self.status = self.fig.text(
             0.5,
@@ -535,7 +739,7 @@ class LiveSensor2D:
             return "Peak change (V)"
         if self.args.mode == "voltage":
             return "Mean voltage (V)"
-        return "Mean ADC"
+        return "Peak cell ADC"
 
     def status_text(self):
         return (
@@ -543,7 +747,8 @@ class LiveSensor2D:
             f"range=+/-{self.limit:.2f}  "
             f"smooth={'on' if self.smooth else 'off'}   |   "
             "b baseline   i smooth   v values   +/- gain   ][ range   "
-            "s snapshot   q quit"
+            + ("r reset max   " if self.args.mode == "raw" else "")
+            + "s snapshot   q quit"
         )
 
     # ---- interaction ----
@@ -552,6 +757,8 @@ class LiveSensor2D:
         key = event.key
         if key == "b":
             self.rearm_baseline()
+        elif key == "r":
+            self.held_max = None
         elif key == "i":
             self.smooth = not self.smooth
             self.image.set_interpolation(
@@ -597,6 +804,14 @@ class LiveSensor2D:
 
     def update(self, sample):
         frame_index, millis, raw_grid = sample
+        if getattr(self.source, "switched", False):
+            # --follow picked up a new capture session: start over.
+            self.source.switched = False
+            self.rearm_baseline()
+            self.first_millis = None
+            self.held_max = None
+            self.trend_times.clear()
+            self.trend_values.clear()
         if self.first_millis is None:
             self.first_millis = millis
         grid = self.orient(raw_grid)
@@ -653,8 +868,20 @@ class LiveSensor2D:
             trend_value = float(matrix.mean())
         else:
             self.centroid_marker.set_data([], [])
-            contact_text = f"mean {matrix.mean():.1f}"
-            trend_value = float(matrix.mean())
+            peak = float(matrix[peak_row, peak_column])
+            if self.held_max is None or peak > self.held_max[0]:
+                self.held_max = (peak, peak_row, peak_column)
+            saturated_rows, saturated_columns = np.nonzero(
+                matrix >= SATURATION_ADC
+            )
+            self.saturation_marker.set_data(saturated_columns, saturated_rows)
+            held, held_row, held_column = self.held_max
+            contact_text = (
+                f"peak {peak:.0f}  |  held max {held:.0f} @ "
+                f"(R{held_row + 1}, C{held_column + 1})  |  "
+                f"saturated {len(saturated_rows)}"
+            )
+            trend_value = peak
 
         unit = "" if self.args.mode == "raw" else " V"
         self.image_title.set_text(
@@ -676,10 +903,13 @@ class LiveSensor2D:
         self.trend_axis.set_xlim(
             max(0.0, elapsed - self.args.trend_seconds), max(elapsed, 1.0)
         )
-        low = min(self.trend_values)
-        high = max(self.trend_values)
-        margin = max(0.05 * (high - low), 1e-3)
-        self.trend_axis.set_ylim(low - margin, high + margin)
+        if self.args.mode == "raw":
+            self.trend_axis.set_ylim(0.0, ADC_MAX + 5.0)
+        else:
+            low = min(self.trend_values)
+            high = max(self.trend_values)
+            margin = max(0.05 * (high - low), 1e-3)
+            self.trend_axis.set_ylim(low - margin, high + margin)
 
         if self.show_labels:
             for flat_index, artist in enumerate(self.label_artists):
@@ -750,6 +980,12 @@ def main(argv=None):
     if args.simulate:
         print("Simulated sensor stream (no hardware).", flush=True)
         source = SimulatedSource(24.0, 180.0, 60.0)
+    elif args.follow:
+        try:
+            source = CsvFollowSource(args.follow)
+        except Exception as exc:
+            print(f"Cannot follow the capture: {exc}", file=sys.stderr)
+            return 1
     else:
         try:
             source = SerialSource(args.port, args.baud, args.handshake_timeout)
@@ -757,7 +993,15 @@ def main(argv=None):
             print(f"Cannot start the sensor stream: {exc}", file=sys.stderr)
             return 1
 
-    LiveSensor2D(args, source).run()
+    recorder = None
+    if args.record:
+        recorder = SessionRecorder(args.record)
+        source.on_frame = recorder
+    try:
+        LiveSensor2D(args, source).run()
+    finally:
+        if recorder is not None:
+            recorder.close()
     return 0
 
 

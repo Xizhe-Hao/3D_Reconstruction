@@ -1216,6 +1216,7 @@ def sensor_writer_worker(
                     ]
                 )
 
+            last_flush = time.monotonic()
             try:
                 while not (reader_done.is_set() and frame_queue.empty()):
                     try:
@@ -1316,7 +1317,11 @@ def sensor_writer_worker(
                         frame_count = stats.frames
                     frame_queue.task_done()
 
-                    if frame_count % 30 == 0:
+                    # Flush about five times a second so live_sensor_2d.py
+                    # --follow can show the capture as it runs.
+                    now = time.monotonic()
+                    if now - last_flush >= 0.2:
+                        last_flush = now
                         raw_handle.flush()
                         if corrected_handle is not None:
                             corrected_handle.flush()
