@@ -448,6 +448,16 @@ def parse_args(argv=None):
         type=float,
         help="Colour-scale half-range in volts; defaults to 0.5 for change.",
     )
+    parser.add_argument(
+        "--deadband",
+        type=float,
+        default=4.0,
+        help=(
+            "--mode change: zero changes of at most this many ADC counts. Row/"
+            "column ghosting is a 1-3 count step and real contact jumps past "
+            "~30, so 4 hides both noise and ghosting; 0 shows everything."
+        ),
+    )
     parser.add_argument("--gain", type=float, default=1.0)
     parser.add_argument(
         "--invert",
@@ -518,6 +528,8 @@ def parse_args(argv=None):
         parser.error("--record needs a serial port (not --follow or --simulate)")
     if args.baseline_frames < 1:
         parser.error("--baseline-frames must be at least 1")
+    if args.deadband < 0:
+        parser.error("--deadband must be non-negative")
     if args.gain <= 0:
         parser.error("--gain must be positive")
     if args.display_range is not None and args.display_range <= 0:
@@ -612,7 +624,10 @@ class LiveSensor2D:
                 return np.zeros((ROWS, COLS)), False
 
         sign = -1.0 if self.args.invert else 1.0
-        return sign * (voltage - self.baseline) * self.gain, True
+        change = voltage - self.baseline
+        floor = self.args.deadband * self.args.adc_ref / ADC_MAX
+        change = np.where(np.abs(change) > floor + 1e-9, change, 0.0)
+        return sign * change * self.gain, True
 
     # ---- figure ----
 
