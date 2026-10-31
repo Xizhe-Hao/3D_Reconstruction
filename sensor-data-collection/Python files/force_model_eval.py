@@ -24,6 +24,9 @@ sensor reads nothing under load (dead zone), counts per newton per force band
 (the resolution one 8-bit count buys) and the loading/unloading gap at the same
 force (hysteresis).
 
+Sessions of the 16x16 M16B board and the 4x4 ESP32 board can be mixed: the
+grid, the frame rate and the press direction come from each session's data.
+
 Outputs in --out: eval.json, predictions.csv, model_eval.png.
 """
 
@@ -38,7 +41,8 @@ import numpy as np
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.isotonic import IsotonicRegression
 
-from tactile_preprocess import FPS, baseline, clean, frame_features, history_features, load_raw
+from tactile_preprocess import (baseline, clean, frame_features, frame_rate, history_features, load_raw,
+                                response_sign, session_meta)
 
 BANDS = [(0.1, 0.8, "<0.8 N"), (0.8, 3.0, "0.8-3 N"), (3.0, 7.0, "3-7 N"), (7.0, 40.0, ">7 N")]
 MODELS = ("curve", "frame", "history")
@@ -59,9 +63,11 @@ def parse_args() -> argparse.Namespace:
 def load_session(session: Path, deadband: float, static_rate: float):
     ns, idx, frames = load_raw(session)
     t = (ns - ns[0]) / 1e9
-    delta = clean(frames, baseline(frames, t), deadband)
+    base = baseline(frames, t)
+    sign = response_sign(frames, base, session_meta(session, *frames.shape[1:]))
+    delta = clean(frames, base, deadband, sign=sign)  # pressure positive on either board
     feats = frame_features(delta)
-    feats.update(history_features(feats["peak"], FPS))
+    feats.update(history_features(feats["peak"], frame_rate(ns)))
     row_of = {f: i for i, f in enumerate(idx)}
     with (session / "force_alignment" / "frames.csv").open(newline="") as handle:
         labels = [r for r in csv.DictReader(handle) if r["load_N"] not in ("", "nan")]
@@ -78,7 +84,8 @@ def load_session(session: Path, deadband: float, static_rate: float):
         "static": np.abs(rate) < static_rate,
         "unloading_side": load < 0.9 * recent_max,
         "X": {k: v[rows] for k, v in feats.items()},
-        "peak_cell": np.unravel_index(np.abs(delta).max(axis=0).argmax(), (16, 16)),
+        "peak_cell": np.unravel_index(np.abs(delta).max(axis=0).argmax(), delta.shape[1:]),
+        "grid": delta.shape[1:],
     }
 
 
@@ -231,7 +238,7 @@ def plot(path, table, records):
 
 def main() -> None:
     sessions = [load_session(s, args.deadband, args.static_rate) for s in args.sessions]
-    frame_names = list(frame_features(np.zeros((1, 16, 16))))
+    frame_names = list(frame_features(np.zeros((1, 4, 4))))  # feature names only; any grid gives the same
     hist_names = list(history_features(np.zeros(1)))
     records = []
     for split, test, pred in run_splits(sessions, frame_names, hist_names, args.blocks):
@@ -242,7 +249,9 @@ def main() -> None:
 
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "eval.json").write_text(json.dumps({"mae_static_N": table, "hardware": hw,
-                                                    "sessions": [s["name"] for s in sessions]}, indent=2))
+                                                    "sessions": [s["name"] for s in sessions],
+                                                    "grids": {s["name"]: list(map(int, s["grid"])) for s in sessions}},
+                                                   indent=2))
     with (args.out / "predictions.csv").open("w", newline="") as handle:
         w = csv.writer(handle)
         w.writerow(["split", "session", "t_s", "load_N", "static", *[f"pred_{m}_N" for m in MODELS]])

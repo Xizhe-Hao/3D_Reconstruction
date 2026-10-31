@@ -14,6 +14,10 @@ before moving to the next run:
 
 The two streams are drawn on their own clocks; aligning them is a separate step.
 
+Works for the 16x16 M16B sessions and the 4x4 ESP32 sessions alike: the grid
+comes from the CSV header, the board facts (pitch, intended frame rate) from
+session.json, and the press direction from the data.
+
 Usage:
     python bench_quicklook.py <capture session folder>
     python bench_quicklook.py <session> --force <export.csv> --show
@@ -24,16 +28,15 @@ from __future__ import annotations
 
 import argparse
 import csv
-import re
 import sys
 from datetime import date, datetime
 from pathlib import Path
 
 import numpy as np
 
-ROWS = COLS = 16
-PITCH_MM = 7.5
-EXPECTED_FPS = 6.0  # the rig runs at 6 fps on purpose: 24 fps video is too large for the reconstruction
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "Python files"))
+from tactile_preprocess import grid_columns, response_sign, session_meta  # noqa: E402
+
 TAP_MAX_S = 4.0  # a sync tap (4 mm, 1 s hold at 300 mm/min) touches for ~2.6 s
 TAP_PAIR_GAP_S = 6.0  # taps are ~3 s apart; normal presses rest 15 s
 
@@ -53,11 +56,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_sensor(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Device time (s), frame index, and ADC frames (n, 16, 16) from sensor_raw.csv."""
+    """Device time (s), frame index, and ADC frames (n, rows, cols) from sensor_raw.csv."""
     with path.open(newline="") as handle:
         reader = csv.reader(handle)
         header = next(reader)
-        cells = [header.index(f"r{r}c{c}_adc8") for r in range(1, ROWS + 1) for c in range(1, COLS + 1)]
+        cells, rows, cols = grid_columns(header)
         i_ms, i_idx = header.index("device_millis"), header.index("frame_index")
         millis, index, frames = [], [], []
         for row in reader:
@@ -67,7 +70,7 @@ def load_sensor(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
             index.append(int(row[i_idx]))
             frames.append([float(row[i]) for i in cells])
     millis = np.asarray(millis)
-    return (millis - millis[0]) / 1000.0, np.asarray(index), np.asarray(frames).reshape(-1, ROWS, COLS)
+    return (millis - millis[0]) / 1000.0, np.asarray(index), np.asarray(frames).reshape(-1, rows, cols)
 
 
 def find_force_export(session: Path) -> Path | None:
@@ -132,7 +135,8 @@ def double_taps(segs: list[tuple[int, int]], t: np.ndarray) -> list[tuple[float,
     return pairs
 
 
-def analyse_sensor(t: np.ndarray, index: np.ndarray, frames: np.ndarray, baseline_s: float) -> dict:
+def analyse_sensor(t: np.ndarray, index: np.ndarray, frames: np.ndarray, baseline_s: float,
+                   meta: dict | None = None) -> dict:
     dt = np.diff(t)
     fps = 1.0 / float(np.median(dt)) if dt.size else float("nan")
     dropped = int(np.sum(np.diff(index) - 1)) if index.size > 1 else 0
@@ -141,8 +145,8 @@ def analyse_sensor(t: np.ndarray, index: np.ndarray, frames: np.ndarray, baselin
         base_mask = np.arange(len(t)) < max(5, len(t) // 20)
     baseline = np.median(frames[base_mask], axis=0)
     delta = frames - baseline
-    # The press direction depends on the wiring: pick the sign of the biggest excursion.
-    sign = 1.0 if np.percentile(delta.sum(axis=(1, 2)), 99.5) >= -np.percentile(delta.sum(axis=(1, 2)), 0.5) else -1.0
+    # The press direction depends on the board and wiring: session.json when it says, else the data.
+    sign = response_sign(frames, baseline, meta)
     response = np.clip(sign * delta, 0, None)
     total = response.sum(axis=(1, 2))
     noise = float(np.std(total[base_mask]))
@@ -151,7 +155,7 @@ def analyse_sensor(t: np.ndarray, index: np.ndarray, frames: np.ndarray, baselin
     segs = segments(total > threshold, t)
     peak = int(np.argmax(total))
     weights = response[peak]
-    rows, cols = np.mgrid[0:ROWS, 0:COLS]
+    rows, cols = np.mgrid[0:weights.shape[0], 0:weights.shape[1]]
     if weights.sum() > 0:
         centroid_rc = (float((rows * weights).sum() / weights.sum()), float((cols * weights).sum() / weights.sum()))
     else:
@@ -203,16 +207,20 @@ def analyse_force(t: np.ndarray, load: np.ndarray, distance: np.ndarray, meta: d
 # ---------------------------------------------------------------- report
 
 
-def report_lines(s: dict, f: dict | None) -> list[str]:
+def report_lines(s: dict, f: dict | None, meta: dict | None = None) -> list[str]:
+    meta = meta or {}
     r, c = s["centroid_rc"]
     pr, pc = s["peak_cell"]
+    rows, cols = s["peak_map"].shape
+    pitch = meta.get("pitch_mm")
+    where = f" = (u, v) ({(c + 0.5) * pitch:.1f}, {(r + 0.5) * pitch:.1f}) mm" if pitch else ""
     lines = [
-        f"tactile: {s['frames']} frames, {s['duration_s']:.1f} s, {s['fps']:.1f} fps, dropped {s['dropped']}",
+        f"tactile: {meta.get('board', '?')} {rows}x{cols}, {s['frames']} frames, {s['duration_s']:.1f} s, "
+        f"{s['fps']:.1f} fps, dropped {s['dropped']}, press {'lowers' if s['sign'] < 0 else 'raises'} the ADC",
         f"  baseline noise (sum) {s['noise']:.1f}, end-of-run drift {s['end_drift']:+.1f} "
         f"({s['end_drift'] / max(s['noise'], 1e-9):+.1f} sigma)",
         f"  presses {len(s['segments'])}, sync double-taps {len(s['double_taps'])}",
-        f"  peak cell R{pr + 1}C{pc + 1}; centroid R{r + 1:.2f} C{c + 1:.2f} "
-        f"= (u, v) ({(c + 0.5) * PITCH_MM:.1f}, {(r + 0.5) * PITCH_MM:.1f}) mm",
+        f"  peak cell R{pr + 1}C{pc + 1}; centroid R{r + 1:.2f} C{c + 1:.2f}{where}",
     ]
     if f is not None:
         lines += [
@@ -224,10 +232,11 @@ def report_lines(s: dict, f: dict | None) -> list[str]:
     return lines
 
 
-def warnings(s: dict, f: dict | None) -> list[str]:
+def warnings(s: dict, f: dict | None, meta: dict | None = None) -> list[str]:
     out = []
-    if abs(s["fps"] - EXPECTED_FPS) > 1.0:
-        out.append(f"tactile rate {s['fps']:.1f} fps, expected {EXPECTED_FPS:g} (the rig is meant to run at this rate)")
+    expected = (meta or {}).get("expected_fps")  # None: free-running board, nothing to check
+    if expected and abs(s["fps"] - expected) > 1.0:
+        out.append(f"tactile rate {s['fps']:.1f} fps, expected {expected:g} (the rig is meant to run at this rate)")
     if s["dropped"]:
         out.append(f"{s['dropped']} tactile frames dropped")
     if abs(s["end_drift"]) > 5 * max(s["noise"], 1e-9):
@@ -242,7 +251,7 @@ def warnings(s: dict, f: dict | None) -> list[str]:
     return out
 
 
-def plot(path: Path, t, s: dict, force, f: dict | None, title: str, show: bool) -> None:
+def plot(path: Path, t, s: dict, force, f: dict | None, title: str, show: bool, meta: dict | None = None) -> None:
     import matplotlib
 
     if not show:
@@ -280,14 +289,17 @@ def plot(path: Path, t, s: dict, force, f: dict | None, title: str, show: bool) 
     image = ax_m.imshow(s["peak_map"], cmap="magma", origin="upper")
     r, c = s["centroid_rc"]
     ax_m.plot(c, r, "o", mfc="none", mec="cyan", ms=10)
-    ax_m.set_xticks([0, 7, 15], ["C1", "C8", "C16"])
-    ax_m.set_yticks([0, 7, 15], ["R1", "R8", "R16"])
+    rows, cols = s["peak_map"].shape
+    col_ticks = sorted({0, (cols - 1) // 2, cols - 1})
+    row_ticks = sorted({0, (rows - 1) // 2, rows - 1})
+    ax_m.set_xticks(col_ticks, [f"C{k + 1}" for k in col_ticks])
+    ax_m.set_yticks(row_ticks, [f"R{k + 1}" for k in row_ticks])
     ax_m.set_title(f"peak frame at {t[s['peak_index']]:.1f} s (o = centroid)")
     fig.colorbar(image, ax=ax_m, fraction=0.046)
 
     ax_t.axis("off")
-    text = report_lines(s, f)
-    warns = warnings(s, f)
+    text = report_lines(s, f, meta)
+    warns = warnings(s, f, meta)
     text += ["", "WARNINGS:" if warns else "no warnings"] + [f"- {w}" for w in warns]
     ax_t.text(0, 1, "\n".join(text), va="top", family="monospace", fontsize=7, wrap=True)
     fig.suptitle(title)
@@ -304,19 +316,20 @@ def plot(path: Path, t, s: dict, force, f: dict | None, title: str, show: bool) 
 
 def run(session: Path, force_path: Path | None, baseline_s: float, out: Path | None, show: bool) -> int:
     t, index, frames = load_sensor(session / "sensor_raw.csv")
-    s = analyse_sensor(t, index, frames, baseline_s)
+    board = session_meta(session, frames.shape[1], frames.shape[2])
+    s = analyse_sensor(t, index, frames, baseline_s, board)
     force_path = force_path or find_force_export(session)
     f = force = None
     if force_path is not None:
         meta, ft, load, dist = load_force(force_path)
         force = (ft, load, dist)
         f = analyse_force(ft, load, dist, meta)
-    for line in report_lines(s, f):
+    for line in report_lines(s, f, board):
         print(line)
-    warns = warnings(s, f)
+    warns = warnings(s, f, board)
     for w in warns:
         print(f"WARNING: {w}")
-    plot(out or session / "bench_quicklook.png", t, s, force, f, session.name, show)
+    plot(out or session / "bench_quicklook.png", t, s, force, f, session.name, show, board)
     return 1 if warns else 0
 
 
@@ -337,9 +350,9 @@ def selftest() -> int:
         return load
 
     load = profile(t)
-    rows, cols = np.mgrid[0:ROWS, 0:COLS]
+    rows, cols = np.mgrid[0:16, 0:16]
     footprint = np.exp(-(((rows - 7) ** 2 + (cols - 7) ** 2) / 2.0))
-    frames = 200 - (load[:, None, None] * footprint * 3) + rng.normal(0, 0.7, (len(t), ROWS, COLS))
+    frames = 200 - (load[:, None, None] * footprint * 3) + rng.normal(0, 0.7, (len(t), 16, 16))
     frames = np.clip(np.round(frames), 0, 255)
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -358,9 +371,25 @@ def selftest() -> int:
             for i, (ti, li) in enumerate(zip(ft, profile(ft)), 1):
                 handle.write(f"{i}\t{li:.1f}\t{100 - li / 5:.2f}\t{ti:.3f}\t\n")
         s = analyse_sensor(*load_sensor(session / "sensor_raw.csv"), 3.0)
+        board = session_meta(session, 16, 16)  # no session.json: the 16x16 board, 6 fps intended
         meta, ft2, load2, dist2 = load_force(session / "force" / "export.csv")
         f = analyse_force(ft2, load2, dist2, meta)
-        plot(Path(tmp) / "q.png", t, s, (ft2, load2, dist2), f, "selftest", False)
+        plot(Path(tmp) / "q.png", t, s, (ft2, load2, dist2), f, "selftest", False, board)
+
+        # The same run as a 4x4 ESP32 session: pads R7-10 x C7-10 only, pressing lowers the ADC.
+        session4 = Path(tmp) / "capture_selftest_4x4"
+        (session4 / "force").mkdir(parents=True)
+        with (session4 / "sensor_raw.csv").open("w", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["host_received_ns", "frame_index", "device_millis"]
+                            + [f"r{r}c{c}_adc8" for r in range(1, 5) for c in range(1, 5)])
+            for i, (ti, frame) in enumerate(zip(t, frames)):
+                writer.writerow([int(ti * 1e9), i, int(ti * 1000) + 31] + frame[6:10, 6:10].astype(int).ravel().tolist())
+        (session4 / "session.json").write_text(
+            '{"board": "esp32-4x4", "pad_mm": 8.0, "expected_fps": null, "pressure_lowers_adc": true}')
+        board4 = session_meta(session4, 4, 4)
+        s4 = analyse_sensor(*load_sensor(session4 / "sensor_raw.csv"), 3.0, board4)
+        plot(Path(tmp) / "q4.png", t, s4, (ft2, load2, dist2), f, "selftest 4x4", False, board4)
 
     checks = {
         "fps": abs(s["fps"] - fps) < 0.5,
@@ -368,7 +397,11 @@ def selftest() -> int:
         "tactile double-taps": len(s["double_taps"]) == 2,
         "force double-taps": len(f["double_taps"]) == 2,
         "peak cell R8C8": s["peak_cell"] == (7, 7),
-        "no warnings": not warnings(s, f),
+        "no warnings": not warnings(s, f, board),
+        "4x4 grid": s4["peak_map"].shape == (4, 4) and board4["board"] == "esp32-4x4",
+        "4x4 presses": len(s4["segments"]) == 7,
+        "4x4 peak cell R2C2": s4["peak_cell"] == (1, 1) and s4["sign"] < 0,
+        "4x4 no rate warning": not any("fps" in w for w in warnings(s4, f, board4)),
     }
     for name, ok in checks.items():
         print(f"{'PASS' if ok else 'FAIL'}  {name}")

@@ -23,6 +23,10 @@ search takes many minutes. It does three things:
 A capture that stalled (no frame for > 1 s, e.g. a click in the PowerShell
 window) is cut at the stall: the frames flushed at Ctrl+C carry wrong times.
 
+Works for any grid (16x16 M16B or 4x4 ESP32 sessions): the grid comes from
+the CSV header, the frame times from host_received_ns, and the press
+polarity from the data (see tactile_preprocess).
+
 Outputs in <session>/force_alignment/:
     frames.csv      one row per tactile frame with the force labels
     alignment.json  scale, offset, warp anchors, residuals, warnings
@@ -37,6 +41,8 @@ import json
 from pathlib import Path
 
 import numpy as np
+
+from tactile_preprocess import load_raw, response_sign, session_meta
 
 STALL_S = 1.0
 
@@ -68,19 +74,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_tactile(session: Path, baseline_s: float, warnings: list[str]):
-    with (session / "sensor_raw.csv").open(newline="") as handle:
-        reader = csv.reader(handle)
-        head = next(reader)
-        cells = [head.index(f"r{r}c{c}_adc8") for r in range(1, 17) for c in range(1, 17)]
-        i_ns, i_idx = head.index("host_received_ns"), head.index("frame_index")
-        ns, idx, frames = [], [], []
-        for row in reader:
-            if row:
-                ns.append(int(row[i_ns]))
-                idx.append(int(row[i_idx]))
-                frames.append([float(row[i]) for i in cells])
-    ns, idx = np.asarray(ns, dtype=np.int64), np.asarray(idx)
-    frames = np.asarray(frames).reshape(-1, 16, 16)
+    ns, idx, frames = load_raw(session)  # grid size from the header: 16x16 or 4x4
     gaps = np.flatnonzero(np.diff(ns) > STALL_S * 1e9)
     if gaps.size:
         k = gaps[0]
@@ -90,12 +84,11 @@ def load_tactile(session: Path, baseline_s: float, warnings: list[str]):
     t = (ns - ns[0]) / 1e9
     base_mask = t <= baseline_s
     base = np.median(frames[base_mask], axis=0)
-    delta = frames - base
-    sums = delta.sum(axis=(1, 2))
-    sign = 1.0 if np.percentile(sums, 99.5) >= -np.percentile(sums, 0.5) else -1.0
-    total = np.clip(sign * delta, 0, None).sum(axis=(1, 2))
+    # The press direction depends on the board: the 16x16 board's ADC rises under load, the 4x4's falls.
+    sign = response_sign(frames, base, session_meta(session, *frames.shape[1:]))
+    total = np.clip(sign * (frames - base), 0, None).sum(axis=(1, 2))
     noise = float(np.std(total[base_mask]))
-    return ns, idx, t, total, noise
+    return ns, idx, t, total, noise, frames.shape[1:]
 
 
 def load_force(path: Path):
@@ -276,7 +269,7 @@ def plot(path, t, total, lab_load, indent, phase, inside, pairs, residual, scale
 def main() -> None:
     args = parse_args()
     warnings: list[str] = []
-    ns, idx, t, total, noise = load_tactile(args.session, args.baseline_s, warnings)
+    ns, idx, t, total, noise, grid = load_tactile(args.session, args.baseline_s, warnings)
     meta, ft, load, dist = load_force(args.force_csv)
     tactile_onset = args.tactile_onset or max(50.0, 10 * noise)
     tare = float(np.median(load[:50]))
@@ -304,6 +297,8 @@ def main() -> None:
     loaded = inside & (lab_load > 0.5)
     summary = {
         "session": str(args.session), "force_csv": str(args.force_csv),
+        "grid": [int(grid[0]), int(grid[1])], "frames": int(len(t)),
+        "frame_rate_fps": float(1.0 / np.median(np.diff(t))) if len(t) > 2 else None,
         "coarse": {"corr": coarse[0], "scale": coarse[1], "offset_s": coarse[2]},
         "clock": {"scale": scale, "offset_s": offset, "warp": args.warp,
                   "onset_residual_ms": {"rms": float(np.sqrt(np.mean(residual ** 2)) * 1000) if residual.size else None,

@@ -20,17 +20,22 @@ matches programs that step through increasing depths and repeat.
 The prediction panel is deliberately simple: a cubic curve from total tactile
 response to force, fitted on every cycle except one and tested on that one. It
 shows what the signal supports, not the best a model could do.
+
+Works for any grid (16x16 M16B or 4x4 ESP32 sessions); the press direction is
+taken from the data.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import sys
 from pathlib import Path
 
 import numpy as np
 
-ROWS = COLS = 16
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "Python files"))
+from tactile_preprocess import load_raw, response_sign, session_meta  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -47,22 +52,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_session(session: Path):
-    with (session / "sensor_raw.csv").open(newline="") as handle:
-        reader = csv.reader(handle)
-        head = next(reader)
-        cells = [head.index(f"r{r}c{c}_adc8") for r in range(1, ROWS + 1) for c in range(1, COLS + 1)]
-        idx, frames = [], []
-        for row in reader:
-            if row:
-                idx.append(int(row[1]))
-                frames.append([float(row[i]) for i in cells])
+    _, idx, frames = load_raw(session)  # grid size from the header
     by_index = {i: k for k, i in enumerate(idx)}
-    frames = np.asarray(frames).reshape(-1, ROWS, COLS)
 
     lab = list(csv.DictReader((session / "force_alignment" / "frames.csv").open(newline="")))
     k = np.array([by_index[int(r["frame_index"])] for r in lab])
     base = np.median(frames[:max(10, k[0])], axis=0) if k[0] > 10 else np.median(frames[:30], axis=0)
-    resp = np.clip(frames[k] - base, 0, None)
+    sign = response_sign(frames, base, session_meta(session, *frames.shape[1:]))
+    resp = np.clip(sign * (frames[k] - base), 0, None)
     d = {
         "t": np.array([float(r["t_s"]) for r in lab]),
         "load": np.array([float(r["load_N"]) for r in lab]),
@@ -279,7 +276,7 @@ def page_maps(d, rows, path, title):
             m = d["resp"][r["start_frame"]]
             im = ax.imshow(m, cmap="magma", vmin=0, vmax=vmax, origin="upper")
             w = m.sum()
-            rr, cc = np.mgrid[0:ROWS, 0:COLS]
+            rr, cc = np.mgrid[0:m.shape[0], 0:m.shape[1]]
             if w > 0:
                 ax.plot((cc * m).sum() / w, (rr * m).sum() / w, "o", mfc="none", mec="cyan", ms=7)
             ax.set_title(f"#{r['press']}  {r['depth_mm']:.1f} mm  {r['force_start']:.1f} N\nsum {r['tactile_start']:.0f}",
@@ -298,7 +295,8 @@ def page_maps(d, rows, path, title):
     pick = [pick[0], pick[-1]] if len(pick) > 1 else pick
     n3 = len(pick) + 1
     sub = gs[len(depths) + 1, :].subgridspec(1, n3, wspace=.05)
-    xx, yy = np.meshgrid(np.arange(COLS), np.arange(ROWS))
+    n_rows, n_cols = d["resp"].shape[1:]
+    xx, yy = np.meshgrid(np.arange(n_cols), np.arange(n_rows))
     for k, r in enumerate(pick):
         ax = fig.add_subplot(sub[0, k], projection="3d")
         m = d["resp"][r["start_frame"]]
@@ -312,10 +310,10 @@ def page_maps(d, rows, path, title):
     ax = fig.add_subplot(sub[0, n3 - 1])
     for r, ls in zip(pick, ["-", "--"]):
         m = d["resp"][r["start_frame"]]
-        ax.plot(np.arange(1, ROWS + 1), m.sum(axis=1), ls, color="tab:blue", label=f"rows, #{r['press']}")
-        ax.plot(np.arange(1, COLS + 1), m.sum(axis=0), ls, color="tab:orange", label=f"columns, #{r['press']}")
+        ax.plot(np.arange(1, n_rows + 1), m.sum(axis=1), ls, color="tab:blue", label=f"rows, #{r['press']}")
+        ax.plot(np.arange(1, n_cols + 1), m.sum(axis=0), ls, color="tab:orange", label=f"columns, #{r['press']}")
     ax.set(title="row / column sums (dead or weak lines show as dips)", xlabel="row or column number",
-           ylabel="counts", xticks=range(1, 17))
+           ylabel="counts", xticks=range(1, max(n_rows, n_cols) + 1))
     ax.legend(fontsize=8)
     ax.grid(alpha=.3)
     fig.suptitle(f"{title}: tactile maps at hold start, depth x cycle (o = centroid)", fontsize=14, y=.995)

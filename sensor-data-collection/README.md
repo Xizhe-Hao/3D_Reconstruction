@@ -2,9 +2,16 @@
 
 This project records synchronized data from:
 
-- one 16x16 tactile sensor;
+- one tactile sensor array: the 16x16 Velostat array on an Arduino Nano
+  (M16B firmware), or the 4x4 ESP32 test board for bench force calibration
+  (section 3.6);
 - four Teledyne Blackfly S USB3 cameras; and
 - one Mark-10 force gauge running IntelliMESUR on its own tablet.
+
+The analysis scripts do not care which board a session came from: the grid
+size is read from `sensor_raw.csv`, the frame rate from its timestamps, and
+the board facts (ADC reference, pad size, press direction) from the session's
+`session.json`.
 
 The camera count is not hard-coded. Four is the default everywhere; pass
 `--cameras N` to capture with a different number. Post-processing and replay
@@ -199,7 +206,8 @@ moments, which also absorbs drift that is not a straight line. It subtracts an
 untared force offset, cuts a capture that stalled (no frame for > 1 s), and
 writes `<session>/force_alignment/frames.csv` (per frame: load, distance,
 indentation from contact, press number, loading/hold/unloading) with
-`alignment.json` and `alignment.png`.
+`alignment.json` and `alignment.png`. It works on 16x16 and 4x4 sessions
+alike (`alignment.json` records the grid and the frame rate it found).
 
 ### 2.4 Quick Verification
 
@@ -286,27 +294,51 @@ playback controls: `replay_capture_2d.py` imports them from
 ## 3. Bench Tools (`test/`)
 
 Standalone sensor-only diagnostics. They need no cameras, no force gauge, and
-no capture session — just the Arduino. Run them from the `test` folder with the
-same virtual environment. None of them writes into a capture session; they only
-read the sensor.
+no capture session — just the sensor board (the Arduino or the ESP32). Run
+them from the `test` folder with the same virtual environment. None of them
+writes into an existing capture session; `--record` creates its own.
 
-### 3.1 `live_sensor_2d.py` — Live 2D Pressure Image
+### 3.1 `live_sensor_2d.py` — Live 2D Pressure Image and Bench Recorder
 
 Shows the array as a smooth 2D image using the same signal definition as the
 capture pipeline (`V_sensor = Vdrive - V_adc`, then baseline subtraction), so
 what looks right here looks the same in `replay_capture_multimodal.py`.
 
 ```powershell
-python live_sensor_2d.py --list-ports          # find the Arduino COM port
-python live_sensor_2d.py COM3                  # baseline-subtracted (default)
+python live_sensor_2d.py --list-ports          # find the COM port (the ESP32 board is marked)
+python live_sensor_2d.py COM3                  # 16x16 board, baseline-subtracted (default)
 python live_sensor_2d.py COM3 --mode voltage   # absolute sensor voltage
 python live_sensor_2d.py COM3 --mode raw       # raw 8-bit ADC
+python live_sensor_2d.py --board esp32         # 4x4 ESP32 board; the port is found by its USB id
+python live_sensor_2d.py --board esp32 --mode raw --labels
 python live_sensor_2d.py --simulate            # no hardware, synthetic press
 python live_sensor_2d.py --selftest            # headless render check, saves a PNG
+python live_sensor_2d.py --selftest --board esp32
 ```
 
-Keep the sensor unloaded for the first second: the tool medians the first 24
-frames into the no-load baseline before it starts showing contact.
+`--board` picks the protocol, the grid and the voltage scale (5 V for the
+16x16 board, 3.3 V for the 4x4 board); `--adc-ref` and `--vdrive` override
+the latter. Keep the sensor unloaded for the first second: the tool medians
+the first 24 frames into the no-load baseline before it starts showing
+contact.
+
+**Recording a bench run** (no cameras):
+
+```powershell
+python live_sensor_2d.py COM3 --mode raw --record C:\tactile_data\force_cal
+python live_sensor_2d.py --board esp32 --mode raw --record C:\tactile_data\force_cal_4x4
+python live_sensor_2d.py --board esp32 --mode raw --record C:\tactile_data\force_cal_4x4 --duration 90
+```
+
+`--record` writes `<root>/capture_<stamp>/sensor_raw.csv` in the capture
+script's format (`host_received_ns, frame_index, device_millis, r1c1_adc8 ...`,
+one column per pad of the board) and a `session.json` with the board facts
+(`board`, grid, `adc_reference_v`, `pressure_lowers_adc`, `pad_mm`,
+`pitch_mm`, `expected_fps`) and, at the end, the frame count, drops and the
+measured rate. `bench_quicklook.py`, `align_force_presses.py`,
+`bench_report.py` and `force_model_eval.py` read that session directly. Put
+the IntelliMESUR export in `<session>/force/` afterwards. `--duration S` quits
+by itself after S seconds.
 
 | Key | Action |
 |---|---|
@@ -356,6 +388,8 @@ contact patch, prefer the 2D tool; use the 3D one to read deformation depth.
 Drag with the mouse to orbit at any time. It shares `--mode`, `--gain`,
 `--range`, `--rot90`, `--flip-ud`, and `--flip-lr` with the 2D tool, and imports
 the serial protocol from `live_sensor_2d.py`, so keep the two files together.
+It speaks only the 16x16 board's protocol; the 4x4 board has its own 3D view
+(section 3.6).
 
 ### 3.3 `bench_quicklook.py` — Check a Bench Run
 
@@ -363,11 +397,14 @@ Runs captured with `--no-save-images` have no MP4s for the replay tools.
 This reads `sensor_raw.csv` and the raw IntelliMESUR export in `<session>/force/`,
 plots the tactile response, the load/distance curve and the peak contact map,
 and warns about a wrong frame rate, dropped frames, an untared or out-of-calibration
-force sensor, and a baseline that did not come back.
+force sensor, and a baseline that did not come back. The rate it checks
+against is the session's `expected_fps` (6 fps for the camera rig; none for
+the free-running 4x4 board), and the press direction is printed so a wiring
+surprise is visible at once.
 
 ```powershell
 python bench_quicklook.py <capture session folder>     # writes <session>/bench_quicklook.png
-python bench_quicklook.py --selftest
+python bench_quicklook.py --selftest                   # synthetic 16x16 and 4x4 runs
 ```
 
 ### 3.4 `bench_report.py` — Quantify an Aligned Run
@@ -392,6 +429,69 @@ Use it to confirm the serial link and firmware are alive:
 python livesensor_view.py COM3
 python livesensor_view.py COM3 --raw    # also print per-frame stats
 ```
+
+### 3.6 The 4x4 ESP32 Test Board and Force Calibration
+
+The second board is a 4x4 Velostat test array with **8x8 mm pads**, read by an
+ESP32 through an AD7466 ADC. Its firmware source is not in this repository (the
+lab's ESP32 is flashed with it). What the scripts rely on:
+
+- **USB driver.** The board's CP2104 bridge needs the Silicon Labs CP210x
+  driver. Without it Device Manager shows "CP2104 USB to UART Bridge
+  Controller" with a warning icon and no COM port exists. Download the
+  "CP210x Universal Windows Driver" from Silicon Labs, unzip, and in an
+  administrator PowerShell run
+  `pnputil /add-driver "<unzipped folder>\silabser.inf" /install`, then
+  re-plug the board. The tools find the port by its USB id afterwards.
+- **Protocol.** 1 Mbaud. The host sends one `w` per frame it wants; the board
+  answers each with 1024 bytes (32 rows x 32 columns, 8-bit, 3.3 V reference)
+  followed by a newline. There is no header, index or checksum. Only the
+  top-left 4x4 of the frame is wired to pads (`--roi ROW0 COL0 ROWS COLS` if
+  that changes). Eight credits are kept in flight, so it free-runs at about
+  8-10 fps; the recorder makes the frame index and millis from the host clock.
+- **Signal.** Unloaded pads read about 1.6-1.9 V (125-145 counts); a full press
+  goes towards 0.25 V. Pressing **lowers** the ADC count, the opposite of the
+  16x16 board, and `session.json` says so (`pressure_lowers_adc`); every
+  analysis script flips the sign from it (or, for sessions without one, from
+  the data). Unloaded for 12 s on 2026-10-30 the cells moved 0-1 count, with no
+  drift.
+- **Load limit.** The 6x6 mm indenter is smaller than a pad, so its face
+  (36 mm²) sets the pressure: 4.3 N is the 120 kPa at which Velostat has been
+  reported to take damage, 9 N is 250 kPa. Keep the same <= 9 N ceiling as on
+  the 16x16 board until `check_cell_damage.py probe` says more is safe.
+
+Live views, both able to record:
+
+```powershell
+python live_sensor_2d.py --board esp32 --mode raw --labels                 # 2D image + trend plot
+python live_sensor_2d.py --board esp32 --mode raw --record C:\tactile_data\force_cal_4x4
+python 4X4\matrix_heatmap_ad7466_v3_3d.py                                   # 3D bars (bar drops under pressure)
+python 4X4\matrix_heatmap_ad7466_v3_3d.py --record C:\tactile_data\force_cal_4x4
+```
+
+Only one program can hold the port; close one view before starting the other.
+Both recorders write the same session layout (section 3.1).
+
+**Force calibration run, either board:**
+
+1. Zero the gauge and prepare the IntelliMESUR program (holds at a few
+   depths, repeated cycles; loads <= 9 N).
+2. Start the recorder and keep the sensor unloaded for 5 s (the aligner takes
+   its baseline from `--baseline-s 5`).
+3. Run the program; leave a few unloaded seconds at the end; quit with `q`.
+4. Export the run on the tablet and copy the CSV into `<session>/force/`.
+5. Check, align, report:
+
+```powershell
+python test\bench_quicklook.py <session>
+python "Python files\align_force_presses.py" <session> <session>\force\<export>.csv
+python test\bench_report.py <session>
+python "Python files\force_model_eval.py" <session1> <session2> ... --out <root>\model_eval
+python test\check_cell_damage.py history <root>
+```
+
+`force_model_eval.py` needs at least two sessions; sessions of both boards can
+be mixed, each is read with its own grid, rate and sign.
 
 ## 4. Overhead RealSense D455 (independent depth reference)
 
