@@ -65,7 +65,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--baseline-s", type=float, default=5.0, help="unloaded seconds at the start")
     p.add_argument("--warp", choices=["piecewise", "linear"], default="piecewise")
     p.add_argument("--clock", type=float, nargs=2, default=None, metavar=("SCALE", "OFFSET"),
-                   help="skip the search: tactile_t = SCALE * force_t + OFFSET (e.g. from matched step edges)")
+                   help="skip the coarse search and start the press pairing from tactile_t = SCALE * force_t + "
+                        "OFFSET (e.g. from matched step edges); use when a periodic program aliased the search")
+    p.add_argument("--no-refine", action="store_true",
+                   help="with --clock: keep that straight clock as is, no press pairing or warp")
     p.add_argument("--out", type=Path, default=None)
     return p.parse_args()
 
@@ -178,7 +181,7 @@ def fit_warp(t, total, ft, load, coarse, tactile_onset, args, warnings):
     tp = press_onsets(total, t, tactile_onset, args.min_press_s)
     fp = press_onsets(load, ft, args.force_onset, args.min_press_s)
     linear = np.array([[0.0, offset], [ft[-1], scale * ft[-1] + offset]])
-    if args.clock:
+    if args.clock and args.no_refine:
         return scale, offset, linear, np.zeros((0, 2)), np.zeros(0), fp
     t_on = np.array([p[0] for p in tp])
     pairs, used = [], set()

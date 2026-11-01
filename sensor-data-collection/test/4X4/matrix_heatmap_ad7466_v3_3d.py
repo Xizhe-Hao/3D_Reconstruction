@@ -58,6 +58,8 @@ def parse_args():
                    default=list(ESP32_DEFAULT_ROI), help="wired pads inside the 32x32 frame")
     p.add_argument("--record", type=Path, metavar="ROOT",
                    help="also save every frame to ROOT/capture_<stamp>/sensor_raw.csv (+ session.json)")
+    p.add_argument("--bits", type=int, choices=(8, 12), default=None,
+                   help="bits per pixel the firmware sends; default: detected on connect")
     p.add_argument("--baseline-s", type=float, default=BASELINE_S)
     return p.parse_args()
 
@@ -66,9 +68,10 @@ args = parse_args()
 ROI_I, ROI_J, ROI_Row, ROI_Column = args.roi
 
 try:
-    source = Esp32Source(args.port, roi=tuple(args.roi))
+    source = Esp32Source(args.port, roi=tuple(args.roi), bits=args.bits)
 except Exception as exc:
     raise SystemExit(f"[serial] {exc}")
+ADC_MAX = source.adc_max  # 255 or 4095
 
 recorder = None
 if args.record:
@@ -87,7 +90,7 @@ def start_baseline():
 
 def on_frame(host_ns, frame_index, millis, grid):
     """Runs on the reader thread for every frame: keep the newest, build the baseline, record."""
-    roi = grid.astype(np.float32) * (VREF / 255.0)
+    roi = grid.astype(np.float32) * (VREF / ADC_MAX)
     latest["roi"] = roi
     if baseline["v"] is None:
         baseline["acc"].append(roi)

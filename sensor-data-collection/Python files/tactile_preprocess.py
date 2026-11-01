@@ -4,13 +4,20 @@
     from tactile_preprocess import load_raw, session_meta, frame_rate, baseline, clean, frame_features, history_features
 
 Nothing here assumes a board. The grid size comes from the sensor_raw.csv
-header (r{R}c{C}_adc8 columns, row-major), the frame rate from the host
-timestamps, and the press polarity from the data: the 16x16 M16B board's ADC
-count rises under load, the 4x4 ESP32 + AD7466 board's falls. clean() returns
-pressure-positive counts for both. Board facts the data cannot tell (ADC
-reference, pad size, pitch, whether a rate was intended) come from the
-session's session.json through session_meta(); sessions without one are the
-16x16 board, which is every capture before 2026-10-30.
+header (r{R}c{C}_adc8 or r{R}c{C}_adc12 columns, row-major), the frame rate
+from the host timestamps, and the press polarity from the data: the 16x16
+M16B board's ADC count rises under load, the 4x4 ESP32 + AD7466 board's
+falls. clean() returns pressure-positive counts for both. Board facts the
+data cannot tell (ADC reference, pad size, pitch, whether a rate was
+intended) come from the session's session.json through session_meta();
+sessions without one are the 16x16 board, which is every capture before
+2026-10-30.
+
+Counts are always 8-bit-equivalent: one count is ADC reference / 255
+(19.6 mV on the 16x16 board, 12.9 mV on the 4x4 board). A 12-bit file is
+divided by 16 on loading, so it keeps its extra resolution as fractions of a
+count while every threshold below (deadband, onsets, hard presses) keeps its
+meaning across firmware versions.
 
 What the 2026-10-16 force runs on the 16x16 board (R5C5, R2C7 twice, R7C6) say
 about the signal:
@@ -46,41 +53,52 @@ DEADBAND = 4.0          # counts; ghosting <= 3, real contact >= ~30 (16x16 boar
 FPS = 6.0               # nominal rate of the camera rig; frame_rate() measures the real one
 LAGS_S = (0.5, 1.0, 2.0, 4.0)
 
-CELL_COLUMN = re.compile(r"^r(\d+)c(\d+)_adc8$")
+CELL_COLUMN = re.compile(r"^r(\d+)c(\d+)_adc(\d+)$")
 
 # Board facts for sessions without a session.json (every capture before 2026-10-30).
 M16B_DEFAULTS = {
-    "board": "m16b", "protocol": "M16B v1", "rows": 16, "cols": 16,
+    "board": "m16b", "protocol": "M16B v1", "rows": 16, "cols": 16, "adc_bits": 8,
     "adc_reference_v": 5.0, "sensor_drive_v": 5.0, "pressure_lowers_adc": False,
     "pad_mm": 5.0, "pitch_mm": 7.5, "expected_fps": 6.0,
 }
-META_KEYS = ("rows", "cols", "adc_reference_v", "sensor_drive_v", "pressure_lowers_adc",
+META_KEYS = ("rows", "cols", "adc_bits", "adc_reference_v", "sensor_drive_v", "pressure_lowers_adc",
              "pad_mm", "pitch_mm", "expected_fps")
 
 
-def grid_columns(head: list[str]) -> tuple[list[int], int, int]:
-    """Column indices of every cell in row-major order, and (rows, cols), from a sensor_raw.csv header."""
+def grid_columns(head: list[str]) -> tuple[list[int], int, int, float]:
+    """Cells of a sensor_raw.csv header: (column indices in row-major order, rows, cols, scale).
+
+    `scale` turns the file's values into 8-bit-equivalent counts: 1 for
+    r{R}c{C}_adc8 columns, 16 for r{R}c{C}_adc12 ones (divide by it).
+    """
     found: dict[tuple[int, int], int] = {}
+    bits = None
     for i, name in enumerate(head):
         m = CELL_COLUMN.match(name.strip())
         if m:
             found[(int(m.group(1)), int(m.group(2)))] = i
+            bits = int(m.group(3)) if bits is None else bits
     if not found:
-        raise ValueError("no r{R}c{C}_adc8 columns in the header")
+        raise ValueError("no r{R}c{C}_adc8 / _adc12 columns in the header")
     rows, cols = max(r for r, _ in found), max(c for _, c in found)
     missing = [(r, c) for r in range(1, rows + 1) for c in range(1, cols + 1) if (r, c) not in found]
     if missing:
         raise ValueError(f"grid is {rows}x{cols} but {len(missing)} cell columns are missing, "
-                         f"e.g. r{missing[0][0]}c{missing[0][1]}_adc8")
-    return [found[(r, c)] for r in range(1, rows + 1) for c in range(1, cols + 1)], rows, cols
+                         f"e.g. r{missing[0][0]}c{missing[0][1]}_adc{bits}")
+    cells = [found[(r, c)] for r in range(1, rows + 1) for c in range(1, cols + 1)]
+    return cells, rows, cols, float(2 ** (bits - 8))
 
 
 def load_raw(session: Path):
-    """(host_ns, frame_index, frames[N,R,C] float) from <session>/sensor_raw.csv; R x C from the header."""
+    """(host_ns, frame_index, frames[N,R,C] float) from <session>/sensor_raw.csv.
+
+    R x C and the bit depth come from the header; frames are 8-bit-equivalent
+    counts (a 12-bit file is divided by 16, keeping fractions).
+    """
     with (Path(session) / "sensor_raw.csv").open(newline="") as handle:
         reader = csv.reader(handle)
         head = next(reader)
-        cells, rows, cols = grid_columns(head)
+        cells, rows, cols, scale = grid_columns(head)
         i_ns, i_idx = head.index("host_received_ns"), head.index("frame_index")
         ns, idx, frames = [], [], []
         for row in reader:
@@ -88,8 +106,10 @@ def load_raw(session: Path):
                 ns.append(int(row[i_ns]))
                 idx.append(int(row[i_idx]))
                 frames.append([float(row[i]) for i in cells])
-    return (np.asarray(ns, dtype=np.int64), np.asarray(idx),
-            np.asarray(frames, dtype=float).reshape(-1, rows, cols))
+    frames = np.asarray(frames, dtype=float).reshape(-1, rows, cols)
+    if scale != 1.0:
+        frames /= scale
+    return np.asarray(ns, dtype=np.int64), np.asarray(idx), frames
 
 
 def session_meta(session: Path, rows: int | None = None, cols: int | None = None) -> dict:

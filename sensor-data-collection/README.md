@@ -444,11 +444,19 @@ lab's ESP32 is flashed with it). What the scripts rely on:
   `pnputil /add-driver "<unzipped folder>\silabser.inf" /install`, then
   re-plug the board. The tools find the port by its USB id afterwards.
 - **Protocol.** 1 Mbaud. The host sends one `w` per frame it wants; the board
-  answers each with 1024 bytes (32 rows x 32 columns, 8-bit, 3.3 V reference)
-  followed by a newline. There is no header, index or checksum. Only the
-  top-left 4x4 of the frame is wired to pads (`--roi ROW0 COL0 ROWS COLS` if
-  that changes). Eight credits are kept in flight, so it free-runs at about
-  8-10 fps; the recorder makes the frame index and millis from the host clock.
+  answers each with a 32 x 32 frame (3.3 V reference) followed by a newline:
+  1024 bytes with the 8-bit firmware (`OUTPUT_U8_FRAME 1`) or 2048 bytes of
+  little-endian uint16 holding the AD7466's full 12 bits (`OUTPUT_U8_FRAME 0`,
+  in use since 2026-10-31). The tools detect which on connect (`--bits` to
+  force it). There is no header, index or checksum. Only the top-left 4x4 of
+  the frame is wired to pads (`--roi ROW0 COL0 ROWS COLS` if that changes).
+  Eight credits are kept in flight, so it free-runs at about 8-10 fps; the
+  recorder makes the frame index and millis from the host clock.
+- **Counts.** A 12-bit session has `r1c1_adc12 ...` columns (0-4095). Every
+  analysis script converts to 8-bit-equivalent counts on loading (divides by
+  16, keeping the fraction), so one count is always 12.9 mV on this board and
+  the deadband, onset and hard-press thresholds mean the same for both
+  firmware versions and for the 16x16 board.
 - **Signal.** Unloaded pads read about 1.6-1.9 V (125-145 counts); a full press
   goes towards 0.25 V. Pressing **lowers** the ADC count, the opposite of the
   16x16 board, and `session.json` says so (`pressure_lowers_adc`); every
@@ -460,7 +468,8 @@ lab's ESP32 is flashed with it). What the scripts rely on:
   reported to take damage, 9 N is 250 kPa. Keep the same <= 9 N ceiling as on
   the 16x16 board until `check_cell_damage.py probe` says more is safe.
 
-Live views, both able to record:
+Live views, both able to record (paths are relative to the `test` folder;
+from the repository root prefix them with `sensor-data-collection\test\`):
 
 ```powershell
 python live_sensor_2d.py --board esp32 --mode raw --labels                 # 2D image + trend plot
@@ -480,7 +489,8 @@ Both recorders write the same session layout (section 3.1).
    its baseline from `--baseline-s 5`).
 3. Run the program; leave a few unloaded seconds at the end; quit with `q`.
 4. Export the run on the tablet and copy the CSV into `<session>/force/`.
-5. Check, align, report:
+5. Check, align, report (paths relative to the `sensor-data-collection`
+   folder; from the repository root prefix them with `sensor-data-collection\`):
 
 ```powershell
 python test\bench_quicklook.py <session>
@@ -490,8 +500,93 @@ python "Python files\force_model_eval.py" <session1> <session2> ... --out <root>
 python test\check_cell_damage.py history <root>
 ```
 
-`force_model_eval.py` needs at least two sessions; sessions of both boards can
-be mixed, each is read with its own grid, rate and sign.
+`force_model_eval.py` runs on one session (within-session splits only) or
+several; sessions of both boards can be mixed, each is read with its own grid,
+rate and sign.
+
+Two lessons from the first 4x4 Mark-10 run (2026-10-31): a strictly periodic
+program (identical cycles, identical gaps) lets the coarse search lock on a
+cycle too late, and the IntelliMESUR time column ran 12.5 % slow. If the
+aligned plot is shifted, pass the clock from matched step edges, e.g.
+`--clock 1.1266 328.7` (press pairing then refines it; `--no-refine` keeps it
+rigid). Put a non-periodic sync pattern (two short taps 2 s and 5 s apart) at
+the start and end of the program and the search finds it on its own. Also:
+with a 6x6 mm flat indenter the pad reached its plateau at about 2.5 N and read
+the same up to 20 N (the response follows contact area more than force), so
+use a platen that covers the pad, or a hemispherical tip, and position control
+let the force drift and overshoot; prefer load-limit steps.
+
+**Dead-weight calibration (`weight_cal.py`, `weight_report.py`,
+`weight_summary.py`).** No gauge, no alignment: the weights (10 / 20 / 50 /
+100 / 200 g, placed one at a time directly on the pad) are marked with SPACE on
+the same host clock that stamps the frames. One run walks through every pad.
+
+1. Start the run:
+
+   ```powershell
+   python test\weight_cal.py --board esp32 --record C:\tactile_data\weight_cal --pads all
+   python test\weight_cal.py --board esp32 --record C:\tactile_data\weight_cal --pads R2C2,R3C3 --reps 6
+   python test\weight_cal.py --simulate --pads all                 # dry run without hardware
+   ```
+
+   The map outlines the target pad. SPACE starts it: a new
+   `capture_<stamp>_RxCy` session opens and the pad must stay empty for the
+   5 s baseline. Then the prompt says which weight to put on ("PUT ON 100 g on
+   R2C2"); centre it, press SPACE, the hold countdown runs (`--hold-s 15`, the
+   response creeps for several seconds), take it off, press SPACE, and an
+   unloaded rest follows (`--rest-s 8`). The status line shows the peak cell,
+   centroid and footprint and turns red when the peak is on another cell than
+   the target or when the target carries less than 70 % of the response. When
+   the pad's steps are done its session is closed, labels are written, a
+   one-line summary (counts per weight, WEAK / DEAD flag) is printed, and the
+   next pad is announced. Progress and a time estimate sit at the top. `U`
+   undoes the last mark, `N` skips a step, `P` skips the rest of a pad, `Q`
+   quits (finished pads keep their labels). Five single weights give 5 loads
+   (0.1 ... 2.0 N) per pass; `--reps 3` passes per pad alternate ascending,
+   descending and shuffled order (about 8 min per pad, 2 h for 16);
+   `--shuffle-pads` randomises the pad order; `--stack` uses every
+   combination when weights can be piled; `--tare-step` adds a 0 g step;
+   `--platen-g` is only for a tare that stays on the pad throughout.
+2. Per pad session: `weights/events.csv` holds the marks and
+   `force_alignment/frames.csv` is written in the aligner's layout (load_N,
+   press = step, phase = loading until the last 5 s of the hold, then hold,
+   unloading, idle), so `bench_quicklook.py`, `force_model_eval.py --deadband 1`
+   and `check_cell_damage.py` read the session unchanged.
+   `--relabel <session> --last-s 5` rebuilds it.
+3. One pad:
+
+   ```powershell
+   python test\weight_report.py <session>
+   ```
+
+   Because a wide-based weight can also load the neighbours, the exactly known
+   quantity is the total load, and the primary curve is the **summed response
+   over the footprint -> N**; the pad-only curve is scored alongside. The
+   plateau is the last 5 s of each hold. Per step: summed and pad plateau,
+   footprint (cells, pad share, centroid), noise, creep, settle time, residual
+   after removal. Per mass: repetition std, separation from the next mass in
+   noise units, counts per newton, the force resolution that follows,
+   hysteresis. Monotone curves fitted on all but one repetition are scored on
+   the held-out one (with 4-5 masses that score is optimistic; std / slope is
+   the honest error). Writes `report/weight_report.png`, `weight_steps.csv`,
+   `weight_report.json`.
+4. The whole array:
+
+   ```powershell
+   python test\weight_summary.py C:\tactile_data\weight_cal
+   ```
+
+   Runs the report on every pad session, prints a pad x mass table with
+   DEAD / WEAK / SPREAD / MISPLACED flags, maps the gain, repetition std and
+   noise over the array, and fits one shared curve shape with a gain per pad
+   (alternating isotonic regression). Its held-out-pad score (shape from the
+   other pads, the pad's gain from a single 200 g weight) says whether a new
+   pad can be calibrated from one weight once the array's shape is known.
+   Writes `weight_summary.png`, `.csv`, `.json` in the root.
+
+Repeat a pad on another day before trusting a cross-session model. For a
+multi-point check, put different weights on different pads at the same time:
+each pad's load is still known, which is what exposes matrix crosstalk.
 
 ## 4. Overhead RealSense D455 (independent depth reference)
 

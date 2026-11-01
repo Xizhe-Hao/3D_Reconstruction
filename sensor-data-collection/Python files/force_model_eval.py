@@ -134,7 +134,7 @@ def run_splits(sessions, frame_names, hist_names, n_blocks):
         for s in group if len(group) > 1 else ():
             train = [o for o in group if o is not s]
             yield "same-cell", s, fit_predict(train, [s], frame_names, hist_names)
-    for s in sessions:
+    for s in sessions if len(sessions) > 1 else ():  # a single session has nothing to train on
         train = [o for o in sessions if o is not s]
         yield "other", s, fit_predict(train, [s], frame_names, hist_names)
 
@@ -220,7 +220,9 @@ def plot(path, table, records):
         ax.spines[["top", "right"]].set_visible(False)
     axes[0].legend(frameon=False)
     ax = axes[-1]
-    rs = [r for r in records if r["split"] == ("same-cell" if "same-cell" in table else "other")]
+    # scatter of the hardest split available: same-cell, else other, else within (single session)
+    scatter_split = next(s for s in ("same-cell", "other", "within") if s in table)
+    rs = [r for r in records if r["split"] == scatter_split]
     y = np.concatenate([r["load"] for r in rs])
     m = np.concatenate([r["static"] for r in rs])
     for model in ("curve", "history"):

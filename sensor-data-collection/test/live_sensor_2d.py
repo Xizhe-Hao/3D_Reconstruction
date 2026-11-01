@@ -11,8 +11,11 @@ Two boards are supported (--board):
     m16b    the 16x16 Velostat array on the Arduino Nano, M16B firmware
             (500 kbaud, READY/START handshake, framed + checksummed), default
     esp32   the 4x4 Velostat test board on the ESP32 + AD7466: 1 Mbaud, one
-            'w' credit per frame, raw 32x32 bytes + '\\n', VREF 3.3 V; only the
-            top-left 4x4 of the frame is wired (--roi), ~8 fps free-running
+            'w' credit per frame, a raw 32x32 frame + '\\n', VREF 3.3 V; only
+            the top-left 4x4 of the frame is wired (--roi), ~8-10 fps
+            free-running. The firmware sends 8-bit pixels (1024 bytes,
+            OUTPUT_U8_FRAME 1) or 12-bit ones (2048 bytes little-endian,
+            OUTPUT_U8_FRAME 0); which one is detected on connect (--bits)
 
 Usage:
     python live_sensor_2d.py COM7                 # 16x16 live, baseline-subtracted
@@ -32,8 +35,10 @@ Usage:
 
 --record writes every frame to <root>/capture_<stamp>/sensor_raw.csv in the
 same format as the capture script (host_received_ns, frame_index,
-device_millis, r1c1_adc8 ...), plus a session.json with the board facts
-(grid, ADC reference, pad size, pitch), so bench_quicklook.py,
+device_millis, r1c1_adc8 ... or r1c1_adc12 ... for the 12-bit firmware; the
+analysis scripts turn 12-bit values into 8-bit-equivalent counts, so every
+threshold keeps its meaning), plus a session.json with the board facts
+(grid, ADC bits and reference, pad size, pitch), so bench_quicklook.py,
 align_force_presses.py, bench_report.py and force_model_eval.py work on it
 unchanged for either board. Put the IntelliMESUR export in <session>/force/
 afterwards. --duration S stops by itself after S seconds.
@@ -84,14 +89,17 @@ HEADER_AFTER_MAGIC = 1 + 1 + 1 + 1 + 4 + 4
 FRAME_BYTES = len(MAGIC) + HEADER_AFTER_MAGIC + PAYLOAD_BYTES + 2
 PING_INTERVAL_S = 0.5  # the firmware heartbeat times out after 2 s
 ADC_MAX = 255.0
-SATURATION_ADC = 250  # raw readings at or above this count as saturated
+SATURATION_ADC = 250  # raw readings at or above this count as saturated (ADC rises under load)
+SATURATION_ADC_LOW = 20  # boards whose ADC falls under load: at or below this (0.26 V of 3.3 V) is a full press
 
 # ---- ESP32 + AD7466 board (the firmware behind test/4X4/matrix_heatmap_ad7466*.py) ----
 ESP32_BAUD = 1_000_000
 ESP32_FRAME_W = 32
 ESP32_FRAME_H = 32
+ESP32_FRAME_PIXELS = ESP32_FRAME_W * ESP32_FRAME_H
 ESP32_VID_PID = (0x10C4, 0xEA60)  # Silicon Labs CP2104 on the ESP32 board
 ESP32_DEFAULT_ROI = (0, 0, 4, 4)  # row0, col0, rows, cols of the wired pads inside the 32x32 frame
+ESP32_PIXEL_BYTES = {8: 1, 12: 2}  # firmware OUTPUT_U8_FRAME 1 -> uint8, 0 -> little-endian uint16 (12 bits used)
 
 # Board facts written into session.json by --record and read back by the analysis scripts.
 BOARDS = {
@@ -105,9 +113,10 @@ BOARDS = {
     "esp32": {
         "board": "esp32-4x4", "protocol": "ESP32 AD7466 raw 32x32, 'w' credits",
         "label": "4x4 Velostat test board, ESP32 + AD7466",
-        "rows": ESP32_DEFAULT_ROI[2], "cols": ESP32_DEFAULT_ROI[3], "baud": ESP32_BAUD, "adc_bits": 8,
+        "rows": ESP32_DEFAULT_ROI[2], "cols": ESP32_DEFAULT_ROI[3], "baud": ESP32_BAUD,
+        "adc_bits": 12,  # the AD7466; the firmware sends 8 or 12 of them, detected on connect
         "adc_reference_v": 3.3, "sensor_drive_v": 3.3, "pressure_lowers_adc": True,
-        "pad_mm": 8.0, "pitch_mm": None, "expected_fps": None,  # free-running, ~8 fps
+        "pad_mm": 8.0, "pitch_mm": None, "expected_fps": None,  # free-running, ~8-10 fps
     },
 }
 
@@ -117,16 +126,16 @@ MODE_COLORMAPS = {
     "raw": "viridis",
 }
 
-CELL_COLUMN = re.compile(r"^r(\d+)c(\d+)_adc8$")
+CELL_COLUMN = re.compile(r"^r(\d+)c(\d+)_adc(\d+)$")
 
 
 def header_grid(head):
-    """(rows, cols) from a sensor_raw.csv header; the cells are r{R}c{C}_adc8, row-major."""
+    """(rows, cols, bits) from a sensor_raw.csv header; the cells are r{R}c{C}_adc{bits}, row-major."""
     cells = [CELL_COLUMN.match(name.strip()) for name in head]
-    cells = [(int(m.group(1)), int(m.group(2))) for m in cells if m]
+    cells = [(int(m.group(1)), int(m.group(2)), int(m.group(3))) for m in cells if m]
     if not cells:
-        raise ValueError("no r{R}c{C}_adc8 columns in the header")
-    return max(r for r, _ in cells), max(c for _, c in cells)
+        raise ValueError("no r{R}c{C}_adc{bits} columns in the header")
+    return max(r for r, _, _ in cells), max(c for _, c, _ in cells), cells[0][2]
 
 
 def parse_frames(buffer):
@@ -172,6 +181,8 @@ class SerialSource:
 
     shape = (ROWS, COLS)
     board = "m16b"
+    bits = 8
+    adc_max = ADC_MAX
 
     def __init__(self, port, baud, handshake_timeout):
         import serial
@@ -305,19 +316,21 @@ def find_esp32_port():
 class Esp32Source:
     """Reads raw 32x32 frames from the ESP32 + AD7466 board and crops the wired pads.
 
-    The host sends one 'w' per frame it wants; the board answers each with
-    32 x 32 bytes (8-bit, VREF 3.3 V, row-major) followed by '\\n'. There is no
+    The host sends one 'w' per frame it wants; the board answers each with a
+    32 x 32 frame (row-major, VREF 3.3 V) followed by '\\n': one byte per
+    pixel from the 8-bit firmware (OUTPUT_U8_FRAME 1) or a little-endian
+    uint16 holding the AD7466's 12 bits (OUTPUT_U8_FRAME 0). There is no
     header, index or checksum, so the frame index and the millis column are
-    made here from the host clock, and the '\\n' after every 1024th byte is
-    the only framing check. PIPELINE_TARGET credits are kept in flight so the
-    board scans continuously (about 8 fps, 124 ms per 32x32 scan).
+    made here from the host clock, and the '\\n' after every frame is the only
+    framing check. PIPELINE_TARGET credits are kept in flight so the board
+    scans continuously (about 8-10 fps, ~100 ms per 32x32 scan).
     """
 
     PIPELINE_TARGET = 8
     PIPELINE_LOW = 3
     READ_TIMEOUT_S = 0.5  # no byte for this long: the credits were lost, start over
 
-    def __init__(self, port=None, baud=ESP32_BAUD, roi=ESP32_DEFAULT_ROI):
+    def __init__(self, port=None, baud=ESP32_BAUD, roi=ESP32_DEFAULT_ROI, bits=None):
         import serial
 
         self.port_name = port or find_esp32_port()
@@ -335,7 +348,13 @@ class Esp32Source:
             pass
         time.sleep(0.3)
         self.port.reset_input_buffer()
-        print(f"ESP32 board on {self.port_name} @ {baud} baud; pads = frame rows "
+        self.bits = bits or self._detect_bits()
+        if self.bits not in ESP32_PIXEL_BYTES:
+            raise ValueError(f"--bits {self.bits}: the firmware sends 8 or 12 bits per pixel")
+        self.pixel_bytes = ESP32_PIXEL_BYTES[self.bits]
+        self.dtype = np.dtype("<u2") if self.pixel_bytes == 2 else np.dtype(np.uint8)
+        self.adc_max = float(2 ** self.bits - 1)
+        print(f"ESP32 board on {self.port_name} @ {baud} baud, {self.bits}-bit pixels; pads = frame rows "
               f"{self.row0}-{self.row0 + rows - 1}, cols {self.col0}-{self.col0 + cols - 1}", flush=True)
 
         self.on_frame = None  # called with every frame, e.g. by --record
@@ -352,9 +371,33 @@ class Esp32Source:
         """Board facts for session.json."""
         facts = {k: v for k, v in BOARDS["esp32"].items() if k != "label"}
         facts.update(port=self.port_name, baud=self.baud, rows=self.shape[0], cols=self.shape[1],
+                     adc_bits=self.bits, adc_max=int(self.adc_max),
                      roi={"row0": self.row0, "col0": self.col0, "rows": self.shape[0], "cols": self.shape[1],
                           "frame_rows": ESP32_FRAME_H, "frame_cols": ESP32_FRAME_W})
         return facts
+
+    def _detect_bits(self):
+        """Ask for one frame and measure the reply: 1025 bytes is the 8-bit firmware, 2049 the 12-bit one."""
+        for attempt in range(2):
+            self.port.reset_input_buffer()
+            self.port.write(b"w")
+            got = bytearray()
+            deadline, quiet_since = time.time() + 2.0, None
+            while time.time() < deadline and len(got) < 2 * ESP32_FRAME_PIXELS + 1:
+                chunk = self.port.read(4096)
+                if chunk:
+                    got.extend(chunk)
+                    quiet_since = time.time()
+                elif quiet_since is not None and time.time() - quiet_since > 0.3:
+                    break  # the frame is complete; the board only sends against credit
+            for bits, per_pixel in ESP32_PIXEL_BYTES.items():
+                if len(got) == per_pixel * ESP32_FRAME_PIXELS + 1:
+                    return bits
+            if got or attempt:
+                break
+            time.sleep(0.5)  # nothing at all: the board may still be booting after the port opened
+        raise RuntimeError(f"unexpected reply to 'w': {len(got)} bytes (the 8-bit firmware sends 1025, "
+                           "the 12-bit one 2049); give --bits to skip the check")
 
     def _refill(self, credits):
         need = self.PIPELINE_TARGET - credits
@@ -364,7 +407,7 @@ class Esp32Source:
         return credits
 
     def _reader(self):
-        frame_bytes = ESP32_FRAME_W * ESP32_FRAME_H
+        frame_bytes = ESP32_FRAME_PIXELS * self.pixel_bytes
         rows, cols = self.shape
         buf = bytearray()
         credits = self._refill(0)
@@ -395,7 +438,7 @@ class Esp32Source:
                         if credits <= self.PIPELINE_LOW:
                             credits = self._refill(credits)
                         continue
-                    full = np.frombuffer(bytes(buf[:frame_bytes]), dtype=np.uint8)
+                    full = np.frombuffer(bytes(buf[:frame_bytes]), dtype=self.dtype)
                     full = full.reshape(ESP32_FRAME_H, ESP32_FRAME_W)
                     grid = np.ascontiguousarray(full[self.row0:self.row0 + rows, self.col0:self.col0 + cols])
                     del buf[: frame_bytes + 1]
@@ -439,19 +482,20 @@ class Esp32Source:
 class SessionRecorder:
     """Writes every frame to a capture-style session: sensor_raw.csv plus session.json."""
 
-    def __init__(self, root, shape=(ROWS, COLS), meta=None, tool="live_sensor_2d.py --record"):
-        self.session = Path(root).expanduser().resolve() / datetime.now().strftime(
-            "capture_%Y%m%d_%H%M%S"
+    def __init__(self, root, shape=(ROWS, COLS), meta=None, tool="live_sensor_2d.py --record", suffix=""):
+        self.session = Path(root).expanduser().resolve() / (
+            datetime.now().strftime("capture_%Y%m%d_%H%M%S") + suffix
         )
         (self.session / "force").mkdir(parents=True)
         self.rows, self.cols = shape
+        self.bits = int((meta or {}).get("adc_bits") or 8)
         self.handle = (self.session / "sensor_raw.csv").open(
             "w", newline="", encoding="utf-8"
         )
         self.writer = csv.writer(self.handle)
         self.writer.writerow(
             ["host_received_ns", "frame_index", "device_millis"]
-            + [f"r{r + 1}c{c + 1}_adc8" for r in range(self.rows) for c in range(self.cols)]
+            + [f"r{r + 1}c{c + 1}_adc{self.bits}" for r in range(self.rows) for c in range(self.cols)]
         )
         self.frames = 0
         self.dropped = 0
@@ -523,6 +567,8 @@ class CsvFollowSource:
         self.last_check = 0.0
         self.switched = False  # set when a new session is picked up
         self.shape = (ROWS, COLS)
+        self.bits = 8
+        self.adc_max = ADC_MAX
         self.fields = 3 + ROWS * COLS  # host_received_ns, frame_index, device_millis, cells
         if self.follow_root:
             print(f"Watching {self.path} for capture_* sessions ...", flush=True)
@@ -551,7 +597,9 @@ class CsvFollowSource:
         self.handle = newest.open("r", encoding="utf-8", newline="")
         head = self.handle.readline().strip().split(",")
         try:
-            self.shape = header_grid(head)
+            rows, cols, self.bits = header_grid(head)
+            self.shape = (rows, cols)
+            self.adc_max = float(2 ** self.bits - 1)
         except ValueError:
             pass  # header not written yet; keep the previous grid
         self.fields = 3 + self.shape[0] * self.shape[1]
@@ -575,7 +623,7 @@ class CsvFollowSource:
             fields = line.strip().split(",")
             if len(fields) != self.fields or not fields[1].isdigit():
                 continue
-            grid = np.array(fields[3:], dtype=np.uint8).reshape(self.shape)
+            grid = np.array(fields[3:], dtype=np.uint16).reshape(self.shape)
             return int(fields[1]), int(fields[2]), grid
         return None
 
@@ -589,11 +637,14 @@ class SimulatedSource:
     """Synthetic stream so the display can be checked without hardware."""
 
     def __init__(self, fps, baseline_adc, amplitude, paced=True, warmup_s=1.5,
-                 shape=(ROWS, COLS), lowers_adc=True):
+                 shape=(ROWS, COLS), lowers_adc=True, bits=8):
         self.fps = fps
-        self.baseline_adc = baseline_adc
+        self.baseline_adc = baseline_adc  # in 8-bit counts; scaled up for a 12-bit stream
         self.amplitude = amplitude
         self.paced = paced
+        self.bits = bits
+        self.scale = 2.0 ** (bits - 8)
+        self.adc_max = float(2 ** bits - 1)
         # Stay unloaded for warmup_s so the viewer captures a clean no-load
         # baseline before the synthetic press starts, exactly as on the bench.
         self.warmup_s = warmup_s
@@ -635,7 +686,8 @@ class SimulatedSource:
         direction = -1.0 if self.lowers_adc else 1.0
         values = self.baseline_adc + direction * self.amplitude * press * blob
         values += self.random.normal(0.0, 0.8, self.shape)
-        grid = np.clip(np.rint(values), 0, 255).astype(np.uint8)
+        values = np.clip(np.rint(values * self.scale), 0, self.adc_max)
+        grid = values.astype(np.uint16 if self.bits > 8 else np.uint8)
 
         self.frame_index += 1
         return self.frame_index, int(elapsed * 1000), grid
@@ -681,6 +733,13 @@ def parse_args(argv=None):
         help=f"--board esp32: the wired pads inside the 32x32 frame (default {' '.join(map(str, ESP32_DEFAULT_ROI))}).",
     )
     parser.add_argument("--baud", type=int, default=None, help="Default: the board's rate.")
+    parser.add_argument(
+        "--bits",
+        type=int,
+        choices=(8, 12),
+        default=None,
+        help="--board esp32: bits per pixel the firmware sends (8: OUTPUT_U8_FRAME 1, 12: 0). Default: detected.",
+    )
     parser.add_argument(
         "--simulate",
         action="store_true",
@@ -738,7 +797,7 @@ def parse_args(argv=None):
         action="store_true",
         help="Show baseline minus sensor voltage instead.",
     )
-    parser.add_argument("--vmax", type=int, default=255, help="--mode raw only.")
+    parser.add_argument("--vmax", type=int, default=None, help="--mode raw only; default: the ADC's full scale.")
     parser.add_argument(
         "--contact-threshold",
         type=float,
@@ -812,6 +871,10 @@ def parse_args(argv=None):
         args.roi = list(ESP32_DEFAULT_ROI)
     elif args.board != "esp32":
         parser.error("--roi only applies to --board esp32")
+    if args.bits is not None and args.board != "esp32":
+        parser.error("--bits only applies to --board esp32")
+    if args.vmax is not None and args.vmax <= 0:
+        parser.error("--vmax must be positive")
     if args.selftest:
         args.simulate = True
     needs_port = args.board != "esp32"  # the ESP32 board is found by its USB id
@@ -846,6 +909,14 @@ class LiveSensor2D:
         self.args = args
         self.source = source
         self.rows, self.cols = getattr(source, "shape", (ROWS, COLS))
+        # Raw mode follows the most pressed cell: the highest count on the 16x16
+        # board, the LOWEST on the 4x4 ESP32 board whose ADC falls under load.
+        self.lowers = bool(BOARDS[args.board]["pressure_lowers_adc"])
+        # Raw counts are shown as the firmware sends them (0-255 or 0-4095);
+        # thresholds given in 8-bit counts (deadband, saturation) are scaled.
+        self.bits = int(getattr(source, "bits", 8))
+        self.adc_max = float(getattr(source, "adc_max", 2 ** self.bits - 1))
+        self.scale = self.adc_max / ADC_MAX
         self.gain = args.gain
         self.smooth = args.smooth
         self.show_labels = args.labels
@@ -875,8 +946,8 @@ class LiveSensor2D:
             self.limit = args.display_range or args.vdrive
             self.label = "Sensor voltage (V)"
         else:
-            self.limit = float(args.vmax)
-            self.label = "Raw ADC (8-bit)"
+            self.limit = float(args.vmax or self.adc_max)
+            self.label = f"Raw ADC ({self.bits}-bit)"
 
         self._build_figure()
 
@@ -893,7 +964,7 @@ class LiveSensor2D:
 
     def to_voltage(self, grid):
         return self.args.vdrive - grid.astype(np.float64) * (
-            self.args.adc_ref / ADC_MAX
+            self.args.adc_ref / self.adc_max
         )
 
     def rearm_baseline(self):
@@ -951,7 +1022,8 @@ class LiveSensor2D:
         )
 
         self.image_axis = self.fig.add_subplot(grid[0, 0])
-        cmap = self.args.cmap or MODE_COLORMAPS[self.args.mode]
+        raw_falls = self.args.mode == "raw" and self.lowers
+        cmap = self.args.cmap or ("viridis_r" if raw_falls else MODE_COLORMAPS[self.args.mode])
         vmin = -self.limit if self.args.mode == "change" else 0.0
         self.image = self.image_axis.imshow(
             np.zeros((rows, cols)),
@@ -1029,12 +1101,13 @@ class LiveSensor2D:
         self.trend_axis.grid(True, alpha=0.25)
         self.trend_axis.set_title("Signal trend", fontsize=10)
         if self.args.mode == "raw":
+            level = (SATURATION_ADC_LOW if self.lowers else SATURATION_ADC) * self.scale
             self.trend_axis.axhline(
-                SATURATION_ADC, color="#e8202a", linewidth=1.0, linestyle="--"
+                level, color="#e8202a", linewidth=1.0, linestyle="--"
             )
             self.trend_axis.text(
-                0.01, SATURATION_ADC, " saturation", color="#e8202a",
-                fontsize=8, va="bottom",
+                0.01, level, " saturation (full press)" if self.lowers else " saturation",
+                color="#e8202a", fontsize=8, va="bottom",
                 transform=self.trend_axis.get_yaxis_transform(),
             )
 
@@ -1055,7 +1128,7 @@ class LiveSensor2D:
             return "Peak change (V)"
         if self.args.mode == "voltage":
             return "Mean voltage (V)"
-        return "Peak cell ADC"
+        return "Pressed cell ADC (lowest)" if self.lowers else "Peak cell ADC"
 
     def status_text(self):
         return (
@@ -1063,7 +1136,7 @@ class LiveSensor2D:
             f"range=+/-{self.limit:.2f}  "
             f"smooth={'on' if self.smooth else 'off'}   |   "
             "b baseline   i smooth   v values   +/- gain   ][ range   "
-            + ("r reset max   " if self.args.mode == "raw" else "")
+            + (("r reset min   " if self.lowers else "r reset max   ") if self.args.mode == "raw" else "")
             + "s snapshot   q quit"
         )
 
@@ -1153,9 +1226,10 @@ class LiveSensor2D:
             self.centroid_marker.set_data([], [])
             return
 
-        peak_row, peak_column = np.unravel_index(
-            int(np.argmax(matrix)), matrix.shape
-        )
+        # The most pressed cell: the highest value, except in raw mode on a
+        # board whose ADC falls under load, where it is the lowest.
+        extreme = np.argmin if (self.args.mode == "raw" and self.lowers) else np.argmax
+        peak_row, peak_column = np.unravel_index(int(extreme(matrix)), matrix.shape)
         self.peak_marker.set_data([peak_column], [peak_row])
 
         if self.args.mode == "change":
@@ -1185,15 +1259,18 @@ class LiveSensor2D:
         else:
             self.centroid_marker.set_data([], [])
             peak = float(matrix[peak_row, peak_column])
-            if self.held_max is None or peak > self.held_max[0]:
+            if self.held_max is None or (
+                peak < self.held_max[0] if self.lowers else peak > self.held_max[0]
+            ):
                 self.held_max = (peak, peak_row, peak_column)
-            saturated_rows, saturated_columns = np.nonzero(
-                matrix >= SATURATION_ADC
-            )
+            saturated = (matrix <= SATURATION_ADC_LOW * self.scale if self.lowers
+                         else matrix >= SATURATION_ADC * self.scale)
+            saturated_rows, saturated_columns = np.nonzero(saturated)
             self.saturation_marker.set_data(saturated_columns, saturated_rows)
             held, held_row, held_column = self.held_max
             contact_text = (
-                f"peak {peak:.0f}  |  held max {held:.0f} @ "
+                f"{'lowest' if self.lowers else 'peak'} {peak:.0f}  |  "
+                f"held {'min' if self.lowers else 'max'} {held:.0f} @ "
                 f"(R{held_row + 1}, C{held_column + 1})  |  "
                 f"saturated {len(saturated_rows)}"
             )
@@ -1220,7 +1297,7 @@ class LiveSensor2D:
             max(0.0, elapsed - self.args.trend_seconds), max(elapsed, 1.0)
         )
         if self.args.mode == "raw":
-            self.trend_axis.set_ylim(0.0, ADC_MAX + 5.0)
+            self.trend_axis.set_ylim(0.0, self.adc_max * 1.02)
         else:
             low = min(self.trend_values)
             high = max(self.trend_values)
@@ -1266,8 +1343,9 @@ def simulated_source(args, paced=True, warmup_s=1.5):
     shape = (args.roi[2], args.roi[3]) if args.board == "esp32" else (board["rows"], board["cols"])
     # Unloaded levels as measured: ~10 counts on the 16x16 board, ~135 on the 4x4 board.
     baseline_adc = 135.0 if board["pressure_lowers_adc"] else 180.0
+    bits = args.bits or (12 if args.board == "esp32" else 8)
     return SimulatedSource(24.0, baseline_adc, 60.0, paced=paced, warmup_s=warmup_s,
-                           shape=shape, lowers_adc=board["pressure_lowers_adc"])
+                           shape=shape, lowers_adc=board["pressure_lowers_adc"], bits=bits)
 
 
 def run_selftest(args):
@@ -1316,7 +1394,7 @@ def main(argv=None):
     else:
         try:
             if args.board == "esp32":
-                source = Esp32Source(args.port, args.baud, tuple(args.roi))
+                source = Esp32Source(args.port, args.baud, tuple(args.roi), args.bits)
             else:
                 source = SerialSource(args.port, args.baud, args.handshake_timeout)
         except Exception as exc:

@@ -56,11 +56,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_sensor(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Device time (s), frame index, and ADC frames (n, rows, cols) from sensor_raw.csv."""
+    """Device time (s), frame index, and frames (n, rows, cols) in 8-bit-equivalent counts from sensor_raw.csv."""
     with path.open(newline="") as handle:
         reader = csv.reader(handle)
         header = next(reader)
-        cells, rows, cols = grid_columns(header)
+        cells, rows, cols, scale = grid_columns(header)
         i_ms, i_idx = header.index("device_millis"), header.index("frame_index")
         millis, index, frames = [], [], []
         for row in reader:
@@ -70,7 +70,8 @@ def load_sensor(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
             index.append(int(row[i_idx]))
             frames.append([float(row[i]) for i in cells])
     millis = np.asarray(millis)
-    return (millis - millis[0]) / 1000.0, np.asarray(index), np.asarray(frames).reshape(-1, rows, cols)
+    frames = np.asarray(frames, dtype=float).reshape(-1, rows, cols) / scale
+    return (millis - millis[0]) / 1000.0, np.asarray(index), frames
 
 
 def find_force_export(session: Path) -> Path | None:
