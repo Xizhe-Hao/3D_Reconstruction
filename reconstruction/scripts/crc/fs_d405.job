@@ -1,0 +1,28 @@
+#!/bin/bash
+# FoundationStereo reconstruction of the 2026-11-10 D405 press session, then the indentation evaluation.
+# Same time range, tracking and evaluation settings as the DA3 run; only the depth backend changes.
+# Submit from reconstruction/:
+#   qsub -v SESSION=data/d405_press/capture_20261110_202813 scripts/crc/fs_d405.job
+#$ -q gpu@@crc_a10
+#$ -l gpu_card=1
+#$ -pe smp 8
+#$ -N fs_d405
+#$ -cwd
+#$ -j y
+#$ -o logs/$JOB_NAME.$JOB_ID.log
+set -euo pipefail
+module load conda
+export HF_HOME=$PWD/.cache/huggingface PYTHONUNBUFFERED=1
+SESSION=${SESSION:-data/d405_press/capture_20261110_202813}
+OUT=${OUT:-outputs/20261110_d405_fs}
+nvidia-smi --query-gpu=name,memory.total --format=csv
+conda run --no-capture-output -n mvtracker python scripts/run_test_session.py \
+  --session-dir "$SESSION" --start 14 --end 75 --step 1 --max-frames 370 --width 512 --height 384 \
+  --depth-backend foundationstereo --foundationstereo-pairs 0-2,1-3 \
+  --min-depth-m 0.03 --max-depth-m 2 --query-grid-size 16 --device cuda --output-dir "$OUT"
+R=$(ls -d "$OUT"/seconds_*_foundationstereo | head -1)
+for P in 90 98 95; do
+  conda run --no-capture-output -n mvtracker python scripts/eval_indentation.py --result-dir "$R" --centre-xy 22.7 -63.4 --percentile $P
+  cp "$R/indentation_summary.json" "$R/indentation_summary_p$P.json"
+done
+echo "RESULT_DIR=$R"

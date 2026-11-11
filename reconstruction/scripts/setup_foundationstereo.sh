@@ -22,7 +22,9 @@ fi
 if ! conda env list | awk '{print $1}' | grep -qx "${environment_name}"; then
   conda env create -n "${environment_name}" -f "${foundation_dir}/environment.yml"
 fi
-if ! conda run -n "${environment_name}" python -c "import flash_attn" >/dev/null 2>&1; then
+# The FoundationStereo code never imports flash_attn, and building it from source often fails on
+# clusters; FOUNDATIONSTEREO_SKIP_FLASH_ATTN=1 leaves it out.
+if [[ "${FOUNDATIONSTEREO_SKIP_FLASH_ATTN:-0}" != "1" ]] && ! conda run -n "${environment_name}" python -c "import flash_attn" >/dev/null 2>&1; then
   conda run -n "${environment_name}" python -m pip install flash-attn --no-build-isolation
 fi
 if ! conda run -n "${environment_name}" python -c "import pandas" >/dev/null 2>&1; then
