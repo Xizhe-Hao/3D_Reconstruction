@@ -115,6 +115,14 @@ def main() -> int:
     playback = profile.get_device().as_playback()
     playback.set_real_time(False)
     depth_scale = profile.get_device().first_depth_sensor().get_depth_scale()
+    # Playback of a recording reports the D400 default of 1 mm per unit whatever the
+    # camera used: a D405 records 0.1 mm units and came back as 0.001 on 2026-11-10,
+    # ten times wrong. The sidecar holds what the live sensor reported; trust that.
+    if meta.get("depth_scale_m"):
+        if abs(float(meta["depth_scale_m"]) - depth_scale) > 1e-9:
+            print(f"depth scale: recording says {depth_scale:g} m, live sensor said "
+                  f"{float(meta['depth_scale_m']):g} m -- using the live value")
+        depth_scale = float(meta["depth_scale_m"])
 
     rows = []
     index = 0

@@ -212,7 +212,7 @@ def live(args):
     import matplotlib.pyplot as plt
 
     model = ForceModel.load(args.model)
-    source = Esp32Source(args.port, bits=args.bits)
+    source = Esp32Source(args.port, bits=args.bits, **({"roi": tuple(args.roi)} if args.roi else {}))
     source.start()
     est = Estimator(model, source.shape, source.adc_max, BOARDS["esp32"]["pressure_lowers_adc"],
                     args.baseline_s, args.smooth_s)
@@ -370,6 +370,8 @@ def main():
     b.add_argument("--board", choices=("esp32",), default="esp32")
     b.add_argument("--port", default=None)
     b.add_argument("--bits", type=int, choices=(8, 12), default=None)
+    b.add_argument("--roi", type=int, nargs=4, metavar=("ROW0", "COL0", "ROWS", "COLS"), default=None,
+                   help="window of the 32x32 frame holding wired pads (default 0 0 4 4); e.g. 0 0 6 6")
     b.add_argument("--baseline-s", type=float, default=5.0)
     b.add_argument("--smooth-s", type=float, default=1.0, help="median over this many seconds of frames")
     c = sub.add_parser("replay")

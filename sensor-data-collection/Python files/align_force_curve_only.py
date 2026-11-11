@@ -137,9 +137,23 @@ def parse_args():
         default=DEFAULT_SCALE_STEP,
         help="Coarse step of the scale search; refined tenfold around the best.",
     )
+    parser.add_argument(
+        "--force-start-s",
+        type=float,
+        default=None,
+        help=(
+            "Place the force run this many seconds after the first tactile "
+            "frame instead of searching for it; needs --time-scale. For "
+            "sessions where the tactile array saw no load (nothing to match "
+            "the force curve against) and the placement was found another "
+            "way, e.g. from the depth camera."
+        ),
+    )
     args = parser.parse_args()
     if args.time_scale is not None and args.time_scale <= 0:
         parser.error("--time-scale must be positive")
+    if args.force_start_s is not None and args.time_scale is None:
+        parser.error("--force-start-s needs --time-scale")
     if not 0 < args.scale_range[0] < args.scale_range[1]:
         parser.error("--scale-range needs 0 < LOW < HIGH")
     if args.adc_ref <= 0 or args.vdrive <= 0:
@@ -577,6 +591,17 @@ def main():
     )
     sensor = load_sensor_alignment_data(session, sensor_args)
     alignment, features, force = find_alignment_with_scale(force, sensor, args)
+    if args.force_start_s is not None:
+        searched = {key: alignment.get(key) for key in
+                    ("score", "confidence", "estimated_force_start_ns")}
+        alignment.update({
+            "estimated_force_start_ns": int(sensor["host_ns"][0])
+            + int(round(args.force_start_s * 1e9)),
+            "alignment_mode": "manual_start",
+            "confidence": "manual",
+            "manual_force_start_s": float(args.force_start_s),
+            "tactile_search_result_ignored": searched,
+        })
     output_stem = f"curve_only_{Path(record.archived_path).stem}"
     result = write_force_alignment_outputs(
         session,

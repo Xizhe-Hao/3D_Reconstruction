@@ -83,10 +83,13 @@ def realsense_K_dist(intrinsics: dict):
                   [0, intrinsics["fy"], intrinsics["ppy"]], [0, 0, 1.0]])
     coeffs = np.asarray(intrinsics.get("coeffs", [0] * 5), float)
     model = intrinsics.get("model", "")
-    # librealsense "brown_conrady" uses OpenCV's k1 k2 p1 p2 k3 order. The
-    # "inverse" models describe undistortion instead; their coefficients are
-    # typically ~0 on D400 colour, so treat them as none rather than wrongly.
-    dist = coeffs if "inverse" not in model.lower() else np.zeros(5)
+    # librealsense "brown_conrady" uses OpenCV's k1 k2 p1 p2 k3 order. The D400
+    # colour stream is labelled "inverse_brown_conrady", but its coefficients
+    # behave as ordinary forward ones. They are ~0 on a D455, so it never
+    # mattered there; a D405 reports k1 = -0.052. Measured on 2026-11-10 (414
+    # corners, 12 poses): all-corner median 0.43 px used as forward coefficients,
+    # 0.54 px ignored, 0.57 px applied as a true inverse model.
+    dist = coeffs
     return K, dist
 
 
@@ -244,6 +247,9 @@ def main() -> int:
                         help="board motion between sampled frame sets to still count as still")
     parser.add_argument("--max-tri-rms", type=float, default=2.0,
                         help="drop triangulated corners with a worse re-projection (px)")
+    parser.add_argument("--frames", default=None, metavar="A:B",
+                        help="use only capture_sequence_index A <= i < B, e.g. when the "
+                             "camera was knocked part-way through the recording")
     parser.add_argument("--install", action="store_true",
                         help="also write calibration/d455_world.json")
     parser.add_argument("--selftest", action="store_true")
@@ -258,6 +264,10 @@ def main() -> int:
     spec = BoardSpec.load(args.board)
     meta, frames, kept = collect(session, rig, spec, args.stride, args.still_mm,
                                  args.max_tri_rms)
+    if args.frames:
+        first, last = (int(v) if v else None for v in args.frames.split(":"))
+        kept = [f for f in kept if (first is None or f["seq"] >= first)
+                and (last is None or f["seq"] < last)]
     print(f"{len(frames)} frame sets examined, {len(kept)} with the board still and "
           "seen by the D455 and >= 2 Blackflys")
     if len(kept) < 3:

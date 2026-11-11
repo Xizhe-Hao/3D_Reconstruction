@@ -588,6 +588,15 @@ Repeat a pad on another day before trusting a cross-session model. For a
 multi-point check, put different weights on different pads at the same time:
 each pad's load is still known, which is what exposes matrix crosstalk.
 
+After the pads are recorded: `weight_models.py ROOT` compares global /
+per-pad / shared-shape models, `weight_eval.py ROOT` draws the per-pad
+prediction quality, `weight_live.py train ROOT` writes `force_model.json`
+and `weight_live.py live force_model.json` shows "which pad, how many grams"
+on the board in real time. For training your own model on the frames see
+[docs/WEIGHT_DATA_FOR_ML.md](docs/WEIGHT_DATA_FOR_ML.md)
+(`make_ml_dataset.py` exports one labelled table, `ml_baseline.py` has the
+splits and the numbers to beat).
+
 ## 4. Overhead RealSense D455 (independent depth reference)
 
 The D455 is a cross-check for the multi-view reconstruction on large

@@ -117,7 +117,8 @@ def pad_list(spec, shape, shuffle=False, seed=0):
         pads = [parse_pad(p) for p in spec.split(",") if p.strip()]
     for r, c in pads:
         if not (0 <= r < shape[0] and 0 <= c < shape[1]):
-            raise SystemExit(f"pad {pad_name((r, c))} is outside the {shape[0]}x{shape[1]} array")
+            raise SystemExit(f"pad {pad_name((r, c))} is outside the {shape[0]}x{shape[1]} window; widen it with "
+                             f"--roi 0 0 ROWS COLS (e.g. --roi 0 0 6 6 for pads up to R6C6)")
     if shuffle:
         random.Random(seed).shuffle(pads)
     return pads
@@ -759,6 +760,9 @@ def parse_args(argv=None):
     p.add_argument("--release-s", type=float, default=2.0, help="label: seconds after 'off' counted as unloading")
     p.add_argument("--deadband", type=float, default=0.0, help="label: deadband for tactile_response (counts)")
     p.add_argument("--bits", type=int, choices=(8, 12), default=None)
+    p.add_argument("--roi", type=int, nargs=4, metavar=("ROW0", "COL0", "ROWS", "COLS"), default=None,
+                   help="window of the 32x32 frame that holds wired pads (default 0 0 4 4); "
+                        "pads named RxCy count from the window's top-left")
     args = p.parse_args(argv)
     if args.selftest:
         args.simulate = True
@@ -785,10 +789,11 @@ def build_masses(args):
 
 
 def make_source(args):
+    roi = tuple(args.roi) if args.roi else None
     if args.simulate:
-        return WeightSimSource()
+        return WeightSimSource(shape=(roi[2], roi[3]) if roi else (4, 4))
     if args.board == "esp32":
-        return Esp32Source(args.port, bits=args.bits)
+        return Esp32Source(args.port, bits=args.bits, **({"roi": roi} if roi else {}))
     source = SerialSource(args.port, BOARDS["m16b"]["baud"], 10.0)
     source.shape, source.adc_max, source.board = (16, 16), 255.0, "m16b"
     return source
