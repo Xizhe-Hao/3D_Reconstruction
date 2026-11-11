@@ -12,6 +12,6 @@
 set -euo pipefail
 module load conda
 git -C .. submodule update --init -- reconstruction/submodule/mvtracker reconstruction/submodule/FoundationStereo
-bash scripts/setup_mvtracker.sh
+MVTRACKER_TORCH_PIP=1 bash scripts/setup_mvtracker.sh
 FOUNDATIONSTEREO_SKIP_FLASH_ATTN=1 bash scripts/setup_foundationstereo.sh
 conda run -n mvtracker python -c "import torch; print('mvtracker torch', torch.__version__, torch.version.cuda)"
