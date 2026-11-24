@@ -12,6 +12,10 @@ fi
 # The conda pytorch/nvidia channels no longer solve on some clusters (CRC: pillow/libzlib conflict
 # against python 3.10); MVTRACKER_TORCH_PIP=1 installs the same torch 2.3.0 + CUDA 12.1 from the pip wheels.
 if [[ "${MVTRACKER_TORCH_PIP:-0}" == "1" ]]; then
+    # A CPU-only torch 2.3.0 already in the env satisfies the pin, so pip would keep it; remove it first.
+    if [[ "$(conda run -n mvtracker python -c 'import torch; print(torch.version.cuda)' 2>/dev/null | tail -1)" != "12.1" ]]; then
+        conda run -n mvtracker python -m pip uninstall -y torch torchvision torchaudio || true
+    fi
     conda run -n mvtracker python -m pip install torch==2.3.0 torchvision==0.18.0 torchaudio==2.3.0 \
         --index-url https://download.pytorch.org/whl/cu121
 else
