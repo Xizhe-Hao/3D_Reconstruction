@@ -74,7 +74,8 @@ def load_d455_frames(session_dir: Path | None, d455_world: Path | None = DEFAULT
     frames = D455Frames(
         color_paths, depth_paths,
         depth_scale_m=float(meta.get("depth_scale_m", 0.001)),
-        depth_range_m=(float(meta.get("depth_min_range_m", 0.3)), float(meta.get("depth_max_range_m", 1.0))),
+        # The D405 records depth_max_range_m as null, so fall back on None as well as on a missing key.
+        depth_range_m=(float(meta.get("depth_min_range_m") or 0.3), float(meta.get("depth_max_range_m") or 1.0)),
         # The session's own intrinsics match the recorded resolutions.
         color_intrinsics=meta.get("color_intrinsics"),
         depth_intrinsics=meta.get("depth_intrinsics"),

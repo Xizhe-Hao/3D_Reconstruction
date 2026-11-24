@@ -9,8 +9,15 @@ git -C "${project_dir}" submodule update --init --recursive -- submodule/mvtrack
 if ! conda env list | awk '{print $1}' | grep -qx mvtracker; then
     conda create -n mvtracker python=3.10.12 -y
 fi
-conda install -n mvtracker pytorch==2.3.0 torchvision==0.18.0 torchaudio==2.3.0 pytorch-cuda=12.1 -c pytorch -c nvidia -y
-conda install -n mvtracker --override-channels -c https://repo.anaconda.com/pkgs/main mkl=2023.1.0 intel-openmp=2023.1.0 -y
+# The conda pytorch/nvidia channels no longer solve on some clusters (CRC: pillow/libzlib conflict
+# against python 3.10); MVTRACKER_TORCH_PIP=1 installs the same torch 2.3.0 + CUDA 12.1 from the pip wheels.
+if [[ "${MVTRACKER_TORCH_PIP:-0}" == "1" ]]; then
+    conda run -n mvtracker python -m pip install torch==2.3.0 torchvision==0.18.0 torchaudio==2.3.0 \
+        --index-url https://download.pytorch.org/whl/cu121
+else
+    conda install -n mvtracker pytorch==2.3.0 torchvision==0.18.0 torchaudio==2.3.0 pytorch-cuda=12.1 -c pytorch -c nvidia -y
+    conda install -n mvtracker --override-channels -c https://repo.anaconda.com/pkgs/main mkl=2023.1.0 intel-openmp=2023.1.0 -y
+fi
 conda run -n mvtracker python -m pip install -r "${mvtracker_dir}/requirements.txt"
 if ! git -C "${mvtracker_dir}/../MoGe" rev-parse --git-dir > /dev/null 2>&1; then
     git clone https://github.com/microsoft/MoGe.git "${mvtracker_dir}/../MoGe"

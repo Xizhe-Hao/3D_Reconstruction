@@ -24,6 +24,10 @@ Methods (the same measurement for all of them):
                 is the median of the per-view cell medians, so the D455 is one
                 vote of five rather than outnumbering the RGB views by pixels
     d455        the D455 alone, as a reference sensor
+    d455_first  the depth camera where it has a cell, the four RGB views' median only
+                where it has none (holes such as the punch's shadow)
+    rgb4_d455_mean  the mean of the depth camera and the four RGB views' median, so the
+                depth camera weighs as much as all four RGB views together
 
 Writes <result-dir>/indentation.csv (one row per frame, video frame index =
 the Rerun ``frame_index``) and indentation_summary.json; export_rerun.py then
@@ -48,7 +52,7 @@ if str(SCRIPT_DIR) not in sys.path:
 from eval_accuracy import Rig  # noqa: E402
 
 REPO_ROOT = SCRIPT_DIR.parents[1]
-METHODS = ("rgb4", "rgb4_d455", "d455")
+METHODS = ("rgb4", "rgb4_d455", "d455", "d455_first", "rgb4_d455_mean")
 
 
 # ------------------------------------------------------------------ ground truth
@@ -284,20 +288,32 @@ def main() -> int:
         out.append(grid.of(d455_at(k)))
         return out
 
+    BASE = ("rgb4", "rgb4_d455", "d455")
+
     def method_grids(per_view: list[np.ndarray]) -> dict[str, np.ndarray]:
         return {"rgb4": fuse(per_view[:-1]), "rgb4_d455": fuse(per_view), "d455": per_view[-1]}
+
+    def method_drops(reference: dict, current: dict) -> dict[str, np.ndarray]:
+        # The depth-first methods combine each sensor's drop against its own rest surface,
+        # so a cell never compares a depth-camera height with an RGB height.
+        drops = {m: reference[m] - current[m] for m in BASE}
+        rgb, depth = drops["rgb4"], drops["d455"]
+        first = np.where(np.isfinite(depth), depth, rgb)
+        drops["d455_first"] = first
+        drops["rgb4_d455_mean"] = np.where(np.isfinite(rgb) & np.isfinite(depth), 0.5 * (rgb + depth), first)
+        return drops
 
     references = []
     for frames_p in reference_frames:
         per_frame = [method_grids(view_grids(k)) for k in frames_p]
-        references.append({m: fuse([g[m] for g in per_frame]) for m in METHODS})
+        references.append({m: fuse([g[m] for g in per_frame]) for m in BASE})
 
     estimate = {m: np.full(T, np.nan) for m in METHODS}
     coverage = {m: np.zeros(T, int) for m in METHODS}
     for k in range(T):
-        current = method_grids(view_grids(k))
+        drops = method_drops(references[ref_of[k]], method_grids(view_grids(k)))
         for m in METHODS:
-            drop = references[ref_of[k]][m] - current[m]
+            drop = drops[m]
             drop = drop[np.isfinite(drop)]
             coverage[m][k] = drop.size
             if drop.size >= 20:
@@ -340,11 +356,11 @@ def main() -> int:
     (result / "indentation_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
     print(f"\nindentation vs force-gauge ground truth, loaded frames (mm; + = reconstructed too deep)")
-    print(f"{'method':10s} {'n':>4s} {'bias':>7s} {'MAE':>6s} {'RMSE':>6s} {'p90':>6s} {'slope':>6s} {'corr':>5s}")
+    print(f"{'method':14s} {'n':>4s} {'bias':>7s} {'MAE':>6s} {'RMSE':>6s} {'p90':>6s} {'slope':>6s} {'corr':>5s}")
     for m in METHODS:
         s = summary["loaded_frames"][m]
         if "mae_mm" in s:
-            print(f"{m:10s} {s['n']:4d} {s['bias_mm']:+7.2f} {s['mae_mm']:6.2f} {s['rmse_mm']:6.2f} "
+            print(f"{m:14s} {s['n']:4d} {s['bias_mm']:+7.2f} {s['mae_mm']:6.2f} {s['rmse_mm']:6.2f} "
                   f"{s['p90_abs_mm']:6.2f} {s['slope']:6.3f} {s['corr'] or float('nan'):5.2f}")
     print("\nper press, deepest quarter (median mm):")
     for entry in summary["per_press_peak"]:
