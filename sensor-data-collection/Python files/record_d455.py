@@ -62,6 +62,9 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--output", type=Path, help="folder for the recording")
+    parser.add_argument("--serial", default=None,
+                        help="which RealSense to use when several are connected (serial "
+                             "number); the recording is then named d455_<serial>_<time>")
     parser.add_argument("--preview", action="store_true",
                         help="show depth and colour live to aim the camera; records nothing")
     parser.add_argument("--depth-size", default="848x480",
@@ -108,10 +111,29 @@ def parse_args():
     return args
 
 
+def pick_device(args):
+    """The camera to use: the one with --serial, else the only one connected."""
+    devices = list(rs.context().query_devices())
+    if not devices:
+        sys.exit("no RealSense device found")
+    if args.serial:
+        for device in devices:
+            if device.get_info(rs.camera_info.serial_number) == args.serial:
+                return device
+        seen = ", ".join(d.get_info(rs.camera_info.serial_number) for d in devices)
+        sys.exit(f"no RealSense with serial {args.serial}; connected: {seen}")
+    if len(devices) > 1:
+        seen = ", ".join(d.get_info(rs.camera_info.serial_number) for d in devices)
+        sys.exit(f"{len(devices)} RealSense cameras connected ({seen}); choose one with --serial")
+    return devices[0]
+
+
 def configure(args):
     dw, dh = (int(v) for v in args.depth_size.split("x"))
     cw, ch = (int(v) for v in args.color_size.split("x"))
     config = rs.config()
+    if args.serial:
+        config.enable_device(args.serial)
     config.enable_stream(rs.stream.depth, dw, dh, rs.format.z16, args.depth_fps)
     config.enable_stream(rs.stream.color, cw, ch, rs.format.rgb8, args.fps)
     return config
@@ -145,8 +167,7 @@ def set_disparity_shift(args) -> dict:
     lives in the camera until power-off, so it is always written -- 0 when no
     close range was asked for.
     """
-    devices = rs.context().query_devices()
-    device = devices[0]
+    device = pick_device(args)
     advanced = rs.rs400_advanced_mode(device)
     if not advanced.is_enabled():
         if args.min_range_m is None:
@@ -181,10 +202,7 @@ def set_disparity_shift(args) -> dict:
 def set_sync_mode(args):
     """Set (or clear) genlock before streaming starts; the mode persists in the
     camera until power-off, so a plain recording explicitly sets it back to 0."""
-    devices = rs.context().query_devices()
-    if len(devices) == 0:
-        sys.exit("no RealSense device found")
-    sensor = devices[0].first_depth_sensor()
+    sensor = pick_device(args).first_depth_sensor()
     if not sensor.supports(rs.option.inter_cam_sync_mode):
         if args.genlock:
             sys.exit("this camera/firmware does not support inter_cam_sync_mode")
@@ -234,7 +252,7 @@ def preview(args):
 def record(args):
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     args.output.mkdir(parents=True, exist_ok=True)
-    bag = args.output / f"d455_{stamp}.db3"
+    bag = args.output / (f"d455_{args.serial}_{stamp}.db3" if args.serial else f"d455_{stamp}.db3")
     set_sync_mode(args)
     shift = set_disparity_shift(args)
     config = configure(args)

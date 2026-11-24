@@ -163,6 +163,17 @@ def baseline(frames: np.ndarray, t: np.ndarray, seconds: float = 5.0) -> np.ndar
     return np.median(frames[t <= seconds], axis=0)
 
 
+def baseline_seconds(session_json: dict, default: float = 5.0) -> float:
+    """Length of the unloaded start a session recorded (weight_cal --baseline-s, written since 2026-11-13).
+
+    Older sessions do not state it; they had 5 s, the old default.
+    """
+    try:
+        return float(session_json.get("baseline_s") or default)
+    except (TypeError, ValueError):
+        return default
+
+
 def response_sign(frames: np.ndarray, base: np.ndarray, meta: dict | None = None) -> float:
     """+1 when pressing raises the ADC count (16x16 M16B), -1 when it lowers it (4x4 ESP32).
 

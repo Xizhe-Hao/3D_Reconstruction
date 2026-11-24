@@ -433,8 +433,48 @@ python livesensor_view.py COM3 --raw    # also print per-frame stats
 ### 3.6 The 4x4 ESP32 Test Board and Force Calibration
 
 The second board is a 4x4 Velostat test array with **8x8 mm pads**, read by an
-ESP32 through an AD7466 ADC. Its firmware source is not in this repository (the
-lab's ESP32 is flashed with it). What the scripts rely on:
+ESP32 through an AD7466 ADC. Its firmware is
+`Arduino files/Esp32Matrix32CameraTrigger.ino`. What the scripts rely on:
+
+- **Camera trigger.** The firmware pulses **GPIO13** once per frame, after the
+  scan and before the frame is sent, so every `w` gives one tactile frame and
+  one rising edge for the cameras' OPTOIN (Line0). The serial protocol below
+  is unchanged by this. GPIO33 must not be used for the trigger: it is the
+  column multiplexer's A1 address line. Four opto inputs in parallel draw
+  14-28 mA, more than a 3.3 V pin holds up reliably, so drive them through a
+  5 V buffer (74AHCT125 or a transistor) and join OPTO_GND to the ESP32 GND.
+  Check the whole chain, cameras and pads together, with
+
+  ```powershell
+  cd "Python files"; .\.venv\Scripts\Activate.ps1
+  python ..\..\calibration\check_trigger.py --board esp32 --snapshot C:\tactile_data\trigger_check
+  ```
+
+  It sends `w` at `--trigger-hz` (default 6) and passes when every camera
+  delivered exactly one image per tactile frame.
+
+  Then capture with the same clock (`--trigger-hz`, default 6; the board needs
+  about 120 ms per frame, so 8 is the ceiling):
+
+  ```powershell
+  .\.venv\Scripts\python.exe capture_3blackfly_sensor_force.py --board esp32 --output C:\tactile_data\captures
+  ```
+
+  `sensor_raw.csv` holds the 4x4 pads as `r{R}c{C}_adc12`, frame index =
+  request number, and `session.json` carries the board facts, so the analysis
+  scripts read the session like a `live_sensor_2d.py --record` one. The
+  open-contact repair is 16x16-only and is switched off for this board.
+- **Exposure.** Fresh cameras run `ExposureAuto`/`GainAuto` = Continuous, which
+  silently ignores a manual exposure and pushes the gain to 16-18 dB. Fix both
+  before a capture, exposure first so the gain stays low:
+
+  ```powershell
+  .\.venv\Scripts\python.exe ..\..\calibration\tune_exposure.py --set 30000 --gain-db 0
+  .\.venv\Scripts\python.exe ..\..\calibration\tune_exposure.py --auto --trigger-hz 6 --max-exposure-us 30000
+  ```
+
+  The values stay in the cameras until they lose power; run the capture
+  without `--exposure-us`/`--gain-db` so it keeps them.
 
 - **USB driver.** The board's CP2104 bridge needs the Silicon Labs CP210x
   driver. Without it Device Manager shows "CP2104 USB to UART Bridge

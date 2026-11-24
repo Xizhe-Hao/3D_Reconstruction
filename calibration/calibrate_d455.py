@@ -45,6 +45,8 @@ import numpy as np
 from charuco_board import BoardSpec, make_detector
 
 HERE = Path(__file__).resolve().parent
+DEPTH_DIR = "d455"   # folder of the matched RealSense frames inside a session; set by --depth-dir
+USE_VIEWS = None     # Blackfly indices that may triangulate; None = all. Set by --blackflys
 GENICAM_RG_TO_GRAY = cv.COLOR_BayerBG2GRAY       # see session_io: BayerRG8 is OpenCV BG
 
 
@@ -192,7 +194,7 @@ def detect(detector, gray, upscale: int = 1) -> dict[int, np.ndarray]:
 def collect(session: Path, rig, spec: BoardSpec, stride: int, still_mm: float,
             max_tri_rms: float):
     detector = make_detector(spec.build())
-    d455_dir = session / "d455"
+    d455_dir = session / DEPTH_DIR
     meta = json.loads((d455_dir / "d455.json").read_text(encoding="utf-8"))
     with (d455_dir / "frames.csv").open(newline="", encoding="utf-8") as handle:
         d455_rows = {int(r["capture_sequence_index"]): r for r in csv.DictReader(handle)}
@@ -206,6 +208,8 @@ def collect(session: Path, rig, spec: BoardSpec, stride: int, still_mm: float,
     for seq in sequences:
         observations: dict[int, dict[int, np.ndarray]] = {}
         for view, path in images[seq].items():
+            if USE_VIEWS is not None and view not in USE_VIEWS:
+                continue
             raw = cv.imread(str(path), cv.IMREAD_UNCHANGED)
             gray = cv.cvtColor(raw, GENICAM_RG_TO_GRAY) if raw.ndim == 2 else \
                 cv.cvtColor(raw, cv.COLOR_BGR2GRAY)
@@ -252,8 +256,20 @@ def main() -> int:
                              "camera was knocked part-way through the recording")
     parser.add_argument("--install", action="store_true",
                         help="also write calibration/d455_world.json")
+    parser.add_argument("--depth-dir", default="d455",
+                        help="session folder holding the matched RealSense frames: d455 for the "
+                             "single-camera rig, d405_<serial> when several were recorded")
+    parser.add_argument("--blackflys", type=int, nargs="+", default=None, metavar="INDEX",
+                        help="triangulate the board with only these Blackfly cameras (cam0 = 0 "
+                             "...), e.g. to leave out one that has moved since calibration.json "
+                             "was solved (check_camera_moved.py says which). Default: all")
     parser.add_argument("--selftest", action="store_true")
     args = parser.parse_args()
+    global DEPTH_DIR, USE_VIEWS
+    DEPTH_DIR = args.depth_dir
+    USE_VIEWS = set(args.blackflys) if args.blackflys else None
+    if USE_VIEWS is not None and len(USE_VIEWS) < 2:
+        parser.error("--blackflys needs at least two cameras to triangulate")
     if args.selftest:
         return selftest(args)
     if args.session is None:
@@ -297,7 +313,7 @@ def main() -> int:
               "poses so the pose is well determined in depth.")
 
     K_d, _ = realsense_K_dist(meta["depth_intrinsics"])
-    depths = [cv.imread(str(session / "d455" / "depth" / f"{f['seq']:09d}.png"),
+    depths = [cv.imread(str(session / DEPTH_DIR / "depth" / f"{f['seq']:09d}.png"),
                         cv.IMREAD_UNCHANGED) for f in kept]
     check = depth_check([np.stack(list(f["world"].values())) for f in kept], depths,
                         R_wd, t_wd, K_d, float(meta["depth_scale_m"]))
@@ -329,6 +345,7 @@ def main() -> int:
         "depth_intrinsics": meta["depth_intrinsics"],
         "depth_scale_m": meta["depth_scale_m"],
         "depth_to_color": meta["depth_to_color"],
+        "blackflys_used": sorted(USE_VIEWS) if USE_VIEWS is not None else "all",
         "pnp": {"poses": len(kept), "corners": int(keep.sum()), "rms_px": rms,
                 "frame_sets": [seq for seq, _ in per_pose]},
         "depth_check": check,
@@ -338,12 +355,24 @@ def main() -> int:
                               "offset_mm": check["linear_fit"]["offset_mm"]}
                              if "linear_fit" in check else None),
     }
-    out = session / "d455" / "d455_world.json"
+    out = session / DEPTH_DIR / "d455_world.json"
     out.write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(f"wrote {out}")
     if args.install:
-        (HERE / "d455_world.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
-        print(f"installed {HERE / 'd455_world.json'}")
+        # One file per camera; d455_world.json (what the existing tools read) is
+        # only replaced for the camera it already describes, or when there is none.
+        serial = str(meta.get("serial") or "unknown")
+        targets = [HERE / f"d405_world_{serial}.json"]
+        legacy = HERE / "d455_world.json"
+        try:
+            legacy_serial = str(json.loads(legacy.read_text(encoding="utf-8")).get("serial"))
+        except (OSError, ValueError):
+            legacy_serial = None
+        if legacy_serial in (None, serial):
+            targets.append(legacy)
+        for target in targets:
+            target.write_text(json.dumps(result, indent=2), encoding="utf-8")
+            print(f"installed {target}")
     return 0
 
 
