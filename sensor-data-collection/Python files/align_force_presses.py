@@ -69,6 +69,10 @@ def parse_args() -> argparse.Namespace:
                         "OFFSET (e.g. from matched step edges); use when a periodic program aliased the search")
     p.add_argument("--no-refine", action="store_true",
                    help="with --clock: keep that straight clock as is, no press pairing or warp")
+    p.add_argument("--anchors", type=Path, default=None,
+                   help="CSV with force_time_s,capture_time_s in its first two columns (header row): use "
+                        "these clock anchors instead of pairing tactile onsets, e.g. anchors measured from "
+                        "the cameras. Tactile onsets come late by the sensor's dead zone; these do not")
     p.add_argument("--out", type=Path, default=None)
     return p.parse_args()
 
@@ -185,7 +189,10 @@ def fit_warp(t, total, ft, load, coarse, tactile_onset, args, warnings):
         return scale, offset, linear, np.zeros((0, 2)), np.zeros(0), fp
     t_on = np.array([p[0] for p in tp])
     pairs, used = [], set()
-    for f_on, a, b in fp:
+    if args.anchors:
+        with args.anchors.open(newline="") as handle:
+            pairs = sorted((float(r[0]), float(r[1])) for r in list(csv.reader(handle))[1:] if r)
+    for f_on, a, b in ([] if args.anchors else fp):
         guess = scale * f_on + offset
         if t_on.size == 0:
             break
@@ -195,7 +202,7 @@ def fit_warp(t, total, ft, load, coarse, tactile_onset, args, warnings):
             pairs.append((f_on, t_on[k]))
     pairs = np.array(pairs)
     covered = [p for p in fp if 0 <= scale * p[0] + offset <= t[-1]]
-    if len(pairs) < len(covered):
+    if not args.anchors and len(pairs) < len(covered):
         warnings.append(f"{len(covered) - len(pairs)} of {len(covered)} force presses inside the "
                         "tactile recording found no tactile partner")
     if len(pairs) < 2:
@@ -308,6 +315,7 @@ def main() -> None:
                                         "max": float(np.abs(residual).max() * 1000) if residual.size else None}},
         "presses": {"force": len(fp), "paired": int(len(pairs))},
         "force_run_covered_s": [0.0, min(covered_to, float(ft[-1]))], "force_run_s": float(ft[-1]),
+        "anchor_source": str(args.anchors) if args.anchors else "tactile onsets",
         "tactile_onset": tactile_onset, "frames_labelled": int(inside.sum()),
         "corr_tactile_force": float(np.corrcoef(total[loaded], lab_load[loaded])[0, 1]) if loaded.sum() > 10 else None,
         "anchors_force_s_to_tactile_s": anchors[1:-1].tolist() if args.warp == "piecewise" else anchors.tolist(),

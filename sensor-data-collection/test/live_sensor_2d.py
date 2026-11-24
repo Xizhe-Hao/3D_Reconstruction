@@ -12,7 +12,7 @@ Two boards are supported (--board):
             (500 kbaud, READY/START handshake, framed + checksummed), default
     esp32   the 4x4 Velostat test board on the ESP32 + AD7466: 1 Mbaud, one
             'w' credit per frame, a raw 32x32 frame + '\\n', VREF 3.3 V; only
-            the top-left 4x4 of the frame is wired (--roi), ~8-10 fps
+            frame rows 28-31 x cols 0-3 are wired, rows flipped (--roi), ~8-10 fps
             free-running. The firmware sends 8-bit pixels (1024 bytes,
             OUTPUT_U8_FRAME 1) or 12-bit ones (2048 bytes little-endian,
             OUTPUT_U8_FRAME 0); which one is detected on connect (--bits)
@@ -52,6 +52,7 @@ Keys while the window is focused:
     b        re-capture the no-load baseline
     i        toggle smooth / raw-cell rendering
     v        toggle per-cell value labels
+    a        toggle the short moving average (--average N frames)
     + / -    display gain up / down
     ] / [    display range up / down
     r        reset the held maximum (--mode raw)
@@ -98,7 +99,11 @@ ESP32_FRAME_W = 32
 ESP32_FRAME_H = 32
 ESP32_FRAME_PIXELS = ESP32_FRAME_W * ESP32_FRAME_H
 ESP32_VID_PID = (0x10C4, 0xEA60)  # Silicon Labs CP2104 on the ESP32 board
-ESP32_DEFAULT_ROI = (0, 0, 4, 4)  # row0, col0, rows, cols of the wired pads inside the 32x32 frame
+# row0, col0, rows, cols of the wired pads inside the 32x32 frame. Since 2026-11-12 the 4x4 sensor is on
+# frame rows 28-31 x cols 0-3 with the rows running backwards (pad row R1 is frame row 31), so the crop is
+# flipped top to bottom: R1 = frame row 31 ... R4 = frame row 28. The first 4x4 board was (0, 0, 4, 4), unflipped.
+ESP32_DEFAULT_ROI = (28, 0, 4, 4)
+ESP32_FLIP_ROWS = True
 ESP32_PIXEL_BYTES = {8: 1, 12: 2}  # firmware OUTPUT_U8_FRAME 1 -> uint8, 0 -> little-endian uint16 (12 bits used)
 
 # Board facts written into session.json by --record and read back by the analysis scripts.
@@ -330,11 +335,12 @@ class Esp32Source:
     PIPELINE_LOW = 3
     READ_TIMEOUT_S = 0.5  # no byte for this long: the credits were lost, start over
 
-    def __init__(self, port=None, baud=ESP32_BAUD, roi=ESP32_DEFAULT_ROI, bits=None):
+    def __init__(self, port=None, baud=ESP32_BAUD, roi=ESP32_DEFAULT_ROI, bits=None, flip_rows=ESP32_FLIP_ROWS):
         import serial
 
         self.port_name = port or find_esp32_port()
         self.baud = baud
+        self.flip_rows = bool(flip_rows)  # pad row R1 is the LAST frame row of the window
         self.row0, self.col0, rows, cols = roi
         if not (0 <= self.row0 and self.row0 + rows <= ESP32_FRAME_H
                 and 0 <= self.col0 and self.col0 + cols <= ESP32_FRAME_W and rows > 0 and cols > 0):
@@ -355,7 +361,8 @@ class Esp32Source:
         self.dtype = np.dtype("<u2") if self.pixel_bytes == 2 else np.dtype(np.uint8)
         self.adc_max = float(2 ** self.bits - 1)
         print(f"ESP32 board on {self.port_name} @ {baud} baud, {self.bits}-bit pixels; pads = frame rows "
-              f"{self.row0}-{self.row0 + rows - 1}, cols {self.col0}-{self.col0 + cols - 1}", flush=True)
+              f"{self.row0}-{self.row0 + rows - 1}, cols {self.col0}-{self.col0 + cols - 1}"
+              + (f"; rows flipped (R1 = frame row {self.row0 + rows - 1})" if self.flip_rows else ""), flush=True)
 
         self.on_frame = None  # called with every frame, e.g. by --record
         self.lock = threading.Lock()
@@ -373,7 +380,8 @@ class Esp32Source:
         facts.update(port=self.port_name, baud=self.baud, rows=self.shape[0], cols=self.shape[1],
                      adc_bits=self.bits, adc_max=int(self.adc_max),
                      roi={"row0": self.row0, "col0": self.col0, "rows": self.shape[0], "cols": self.shape[1],
-                          "frame_rows": ESP32_FRAME_H, "frame_cols": ESP32_FRAME_W})
+                          "frame_rows": ESP32_FRAME_H, "frame_cols": ESP32_FRAME_W,
+                          "flip_rows": self.flip_rows})
         return facts
 
     def _detect_bits(self):
@@ -440,7 +448,8 @@ class Esp32Source:
                         continue
                     full = np.frombuffer(bytes(buf[:frame_bytes]), dtype=self.dtype)
                     full = full.reshape(ESP32_FRAME_H, ESP32_FRAME_W)
-                    grid = np.ascontiguousarray(full[self.row0:self.row0 + rows, self.col0:self.col0 + cols])
+                    grid = full[self.row0:self.row0 + rows, self.col0:self.col0 + cols]
+                    grid = np.ascontiguousarray(grid[::-1] if self.flip_rows else grid)
                     del buf[: frame_bytes + 1]
                     credits -= 1
                     if credits <= self.PIPELINE_LOW:
@@ -730,7 +739,8 @@ def parse_args(argv=None):
         nargs=4,
         metavar=("ROW0", "COL0", "ROWS", "COLS"),
         default=None,
-        help=f"--board esp32: the wired pads inside the 32x32 frame (default {' '.join(map(str, ESP32_DEFAULT_ROI))}).",
+        help=f"--board esp32: the wired pads inside the 32x32 frame (default {' '.join(map(str, ESP32_DEFAULT_ROI))}); "
+             "the window's rows are read bottom to top, so R1 is its last frame row.",
     )
     parser.add_argument("--baud", type=int, default=None, help="Default: the board's rate.")
     parser.add_argument(
@@ -791,6 +801,15 @@ def parse_args(argv=None):
             "~30, so 4 hides both noise and ghosting; 0 shows everything."
         ),
     )
+    parser.add_argument(
+        "--average",
+        type=int,
+        default=1,
+        help=(
+            "Display only: mean of the last N frames, per cell (default 1 = off). "
+            "Recorded data (--record) is never averaged."
+        ),
+    )
     parser.add_argument("--gain", type=float, default=1.0)
     parser.add_argument(
         "--invert",
@@ -807,10 +826,12 @@ def parse_args(argv=None):
     parser.add_argument(
         "--smooth",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Bicubic upsampling for a continuous image (default: enabled).",
+        default=None,
+        help="Bicubic upsampling for a continuous image (default: on for m16b, off for the 4x4 esp32 board, "
+             "which is drawn as discrete pads).",
     )
-    parser.add_argument("--labels", action="store_true", help="Per-cell values.")
+    parser.add_argument("--labels", action=argparse.BooleanOptionalAction, default=None,
+                        help="Per-cell values (default: on for the 4x4 esp32 board).")
     parser.add_argument("--cmap", help="Override the colormap.")
     parser.add_argument(
         "--rot90",
@@ -867,6 +888,12 @@ def parse_args(argv=None):
         args.adc_ref = board["adc_reference_v"]
     if args.vdrive is None:
         args.vdrive = board["sensor_drive_v"]
+    if args.smooth is None:
+        args.smooth = args.board != "esp32"  # the 4x4 is shown as its real pads, not an interpolated field
+    if args.labels is None:
+        args.labels = args.board == "esp32"
+    if args.average < 1:
+        parser.error("--average must be at least 1 frame")
     if args.roi is None:
         args.roi = list(ESP32_DEFAULT_ROI)
     elif args.board != "esp32":
@@ -920,6 +947,10 @@ class LiveSensor2D:
         self.gain = args.gain
         self.smooth = args.smooth
         self.show_labels = args.labels
+        # Short moving average of the incoming frames (display only); 'a' toggles it.
+        self.average_n = args.average
+        self.average_on = args.average > 1
+        self.recent = deque(maxlen=args.average)
 
         self.baseline_samples = []
         self.baseline = None
@@ -971,8 +1002,16 @@ class LiveSensor2D:
         self.baseline = None
         self.baseline_samples = []
 
+    def average(self, grid):
+        """Mean of the last --average frames per cell, or the frame itself when averaging is off."""
+        self.recent.append(grid.astype(np.float64))
+        if not self.average_on:
+            return self.recent[-1]
+        return np.mean(np.stack(self.recent), axis=0)
+
     def to_display(self, grid):
         """Return (matrix, ready). `ready` is False while baselining."""
+        grid = self.average(grid)
         if self.args.mode == "raw":
             return grid.astype(np.float64), True
 
@@ -1045,6 +1084,13 @@ class LiveSensor2D:
         )
         self.image_axis.set_xlabel("Column")
         self.image_axis.set_ylabel("Row")
+        # Cell borders, so each pad reads as its own square (hidden while smooth rendering is on).
+        self.image_axis.set_xticks(np.arange(-0.5, cols), minor=True)
+        self.image_axis.set_yticks(np.arange(-0.5, rows), minor=True)
+        self.image_axis.tick_params(which="minor", length=0)
+        self.image_axis.grid(which="minor", color="white", linewidth=3 if max(rows, cols) <= 8 else 0.6)
+        self.image_axis.grid(which="minor", visible=not self.smooth)
+        self.image_axis.tick_params(which="major", length=0)
         colorbar = self.fig.colorbar(
             self.image, ax=self.image_axis, shrink=0.86, pad=0.03
         )
@@ -1072,18 +1118,21 @@ class LiveSensor2D:
             markeredgecolor="#e8202a",
             markeredgewidth=1.8,
         )
+        # On a few discrete pads the centroid circle lands on top of the cell values; its position stays in the title.
+        self.centroid_marker.set_visible(rows * cols > 64)
         self.image_title = self.image_axis.set_title(
             "waiting for frames ...", fontsize=10
         )
 
         self.label_artists = []
-        label_size = 5.2 if rows * cols > 64 else 9.0
+        label_size = 5.2 if rows * cols > 64 else 13.0
         for row in range(rows):
             for column in range(cols):
                 self.label_artists.append(
                     self.image_axis.text(
                         column,
-                        row,
+                        # on a small grid the value sits low in its pad, clear of the peak / centroid markers
+                        row + (0.3 if rows * cols <= 64 else 0.0),
                         "",
                         ha="center",
                         va="center",
@@ -1134,8 +1183,9 @@ class LiveSensor2D:
         return (
             f"board={self.args.board}  mode={self.args.mode}  gain={self.gain:.2f}  "
             f"range=+/-{self.limit:.2f}  "
-            f"smooth={'on' if self.smooth else 'off'}   |   "
-            "b baseline   i smooth   v values   +/- gain   ][ range   "
+            f"smooth={'on' if self.smooth else 'off'}  "
+            f"avg={self.average_n if self.average_on else 1}   |   "
+            "b baseline   i smooth   a avg   v values   +/- gain   ][ range   "
             + (("r reset min   " if self.lowers else "r reset max   ") if self.args.mode == "raw" else "")
             + "s snapshot   q quit"
         )
@@ -1148,11 +1198,14 @@ class LiveSensor2D:
             self.rearm_baseline()
         elif key == "r":
             self.held_max = None
+        elif key == "a":
+            self.average_on = not self.average_on and self.average_n > 1
         elif key == "i":
             self.smooth = not self.smooth
             self.image.set_interpolation(
                 "bicubic" if self.smooth else "nearest"
             )
+            self.image_axis.grid(which="minor", visible=not self.smooth)
         elif key in ("+", "="):
             self.gain = min(self.gain * 1.25, 200.0)
         elif key == "-":
@@ -1197,6 +1250,7 @@ class LiveSensor2D:
             # --follow picked up a new capture session: start over.
             self.source.switched = False
             self.rearm_baseline()
+            self.recent.clear()
             self.first_millis = None
             self.held_max = None
             self.trend_times.clear()
@@ -1299,10 +1353,12 @@ class LiveSensor2D:
         if self.args.mode == "raw":
             self.trend_axis.set_ylim(0.0, self.adc_max * 1.02)
         else:
-            low = min(self.trend_values)
-            high = max(self.trend_values)
-            margin = max(0.05 * (high - low), 1e-3)
-            self.trend_axis.set_ylim(low - margin, high + margin)
+            # Fixed full scale, so a press always looks the same size: the whole ADC span in volts
+            # (times the display gain in change mode); it only extends if a value falls outside it.
+            full = self.args.vdrive if self.args.mode == "voltage" else self.args.adc_ref * self.gain
+            low = min(0.0, min(self.trend_values))
+            high = max(full, max(self.trend_values))
+            self.trend_axis.set_ylim(low - 0.02 * full, high + 0.02 * full)
 
         if self.show_labels:
             n_cols = matrix.shape[1]
@@ -1314,6 +1370,9 @@ class LiveSensor2D:
                     if self.args.mode == "raw"
                     else f"{value:+.2f}"
                 )
+                # White text on the dark ends of the colour scale, dark text elsewhere.
+                shade = self.image.norm(value)
+                artist.set_color("white" if shade < 0.18 or shade > 0.82 else "#111111")
 
     def run(self):
         self.plt.ion()

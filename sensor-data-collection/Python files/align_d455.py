@@ -56,10 +56,12 @@ def capture_times(session: Path) -> list[tuple[int, int]]:
             if len(times) == complete]
 
 
-def find_bag(session: Path, first_ns: int, last_ns: int) -> Path:
+def find_bag(session: Path, first_ns: int, last_ns: int, serial: str | None = None) -> Path:
     candidates = []
     for sidecar in session.parent.glob("d455_*.json"):
         meta = json.loads(sidecar.read_text(encoding="utf-8"))
+        if serial and str(meta.get("serial")) != serial:
+            continue
         start, stop = meta.get("started_host_ns", 0), meta.get("stopped_host_ns", 0)
         bag = sidecar.parent / meta.get("recording", sidecar.with_suffix(".db3").name)
         if bag.exists() and start <= first_ns and stop >= last_ns:
@@ -81,6 +83,10 @@ def main() -> int:
     parser.add_argument("--max-dt-ms", type=float, default=None,
                         help="flag matches further apart than this; default 0.6 of a D455 period")
     parser.add_argument("--jpeg-quality", type=int, default=95)
+    parser.add_argument("--serial", default=None,
+                        help="with several RealSense cameras: use the recording of this one")
+    parser.add_argument("--out-dir", default=None,
+                        help="folder inside the session (default d455, or d405_<serial> with --serial)")
     args = parser.parse_args()
 
     import cv2
@@ -90,7 +96,7 @@ def main() -> int:
     if not targets:
         raise SystemExit("no complete frame sets in the session")
     offset_ns = int(round(args.offset_ms * 1e6))
-    bag = args.bag or find_bag(session, targets[0][1], targets[-1][1])
+    bag = args.bag or find_bag(session, targets[0][1], targets[-1][1], args.serial)
     sidecar = bag.with_suffix(".json")
     meta = json.loads(sidecar.read_text(encoding="utf-8")) if sidecar.exists() else {}
     fps = float(meta.get("fps", 30))
@@ -104,7 +110,7 @@ def main() -> int:
     print(f"session  {session}  ({len(targets)} frame sets)")
     print(f"d455     {bag}")
 
-    out = session / "d455"
+    out = session / (args.out_dir or (f"d405_{args.serial}" if args.serial else "d455"))
     (out / "depth").mkdir(parents=True, exist_ok=True)
     (out / "color").mkdir(parents=True, exist_ok=True)
 

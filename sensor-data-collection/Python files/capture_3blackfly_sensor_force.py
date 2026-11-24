@@ -10,6 +10,15 @@ folder and aligns each exported force run to the tactile stream afterward.
 The rig now uses four cameras, but the camera count is not hard-coded: use
 --cameras N to capture a different number. The single Arduino D9 trigger line
 must reach the OPTOIN input of every connected camera.
+
+--board esp32 reads the ESP32 + AD7466 board instead (firmware
+"Arduino files/Esp32Matrix32CameraTrigger.ino", trigger on GPIO13). That board
+has no clock of its own: it scans, pulses the cameras and answers once per 'w'
+it receives, so this program sends one 'w' every 1/--trigger-hz seconds and
+numbers the frames by request. sensor_raw.csv then holds the wired pads
+(--roi, 4x4 by default) as r{R}c{C}_adc12 columns, the layout
+live_sensor_2d.py --record writes, and session.json carries the board facts
+the analysis scripts read. The open-contact repair is 16x16-only and is off.
 """
 
 from __future__ import annotations
@@ -19,6 +28,7 @@ import csv
 import gc
 import json
 import queue
+import re
 import shutil
 import statistics
 import struct
@@ -62,6 +72,20 @@ COMMAND_STOP = b"M16_STOP\n"
 
 DEFAULT_PORT = "COM6"
 DEFAULT_BAUD = 500_000
+
+# ---- ESP32 + AD7466 board; keep in step with test/live_sensor_2d.py ----
+ESP32_BAUD = 1_000_000
+ESP32_VID_PID = (0x10C4, 0xEA60)  # Silicon Labs CP2104 on the Feather
+ESP32_FRAME_SIDE = 32
+ESP32_FRAME_PIXELS = ESP32_FRAME_SIDE * ESP32_FRAME_SIDE
+ESP32_DEFAULT_ROI = (28, 0, 4, 4)  # row0, col0, rows, cols of the wired pads
+ESP32_FLIP_ROWS = True  # pad row R1 is the last frame row of the window
+ESP32_REFERENCE_V = 3.3
+ESP32_PAD_MM = 8.0
+ESP32_REPLY_TIMEOUT_S = 0.5
+DEFAULT_ESP32_TRIGGER_HZ = 6.0
+M16B_TRIGGER_HZ = 24.0  # only used for the write-load estimate
+CELL_FIELD = re.compile(r"^r\d+c\d+_adc(\d+)$")
 DEFAULT_CAMERA_COUNT = 4
 COLOR_PIXEL_FORMAT_PREFIXES = (
     "Bayer",
@@ -158,8 +182,50 @@ def parse_args():
             "M16B tactile sensor stream."
         )
     )
-    parser.add_argument("--port", default=DEFAULT_PORT)
-    parser.add_argument("--baud", type=int, default=DEFAULT_BAUD)
+    parser.add_argument(
+        "--board",
+        choices=("m16b", "esp32"),
+        default="m16b",
+        help=(
+            "m16b: 16x16 array on the Arduino, which runs its own trigger "
+            "clock (default). esp32: ESP32 + AD7466 board with the trigger on "
+            "GPIO13, paced from this program at --trigger-hz."
+        ),
+    )
+    parser.add_argument(
+        "--port",
+        default=None,
+        help=(
+            f"Sensor serial port. Default: {DEFAULT_PORT} for m16b; the "
+            "CP2104 port is found by its USB id for esp32."
+        ),
+    )
+    parser.add_argument(
+        "--baud",
+        type=int,
+        default=None,
+        help=f"Default: {DEFAULT_BAUD} for m16b, {ESP32_BAUD} for esp32.",
+    )
+    parser.add_argument(
+        "--trigger-hz",
+        type=float,
+        default=DEFAULT_ESP32_TRIGGER_HZ,
+        help=(
+            "--board esp32: tactile frames (= camera triggers) per second. "
+            "The board needs about 120 ms per frame, so 8 is the ceiling."
+        ),
+    )
+    parser.add_argument(
+        "--roi",
+        type=int,
+        nargs=4,
+        default=list(ESP32_DEFAULT_ROI),
+        metavar=("ROW0", "COL0", "ROWS", "COLS"),
+        help=(
+            "--board esp32: the wired pads inside the 32x32 frame "
+            f"(default {' '.join(map(str, ESP32_DEFAULT_ROI))})."
+        ),
+    )
     parser.add_argument(
         "--serial-rx-buffer",
         type=int,
@@ -285,14 +351,22 @@ def parse_args():
     parser.add_argument(
         "--adc-ref",
         type=float,
-        default=DEFAULT_ADC_REFERENCE_V,
-        help="ADC reference voltage used to interpret the received ADC8 values.",
+        default=None,
+        help=(
+            "ADC reference voltage used to interpret the received ADC values "
+            f"(default {DEFAULT_ADC_REFERENCE_V:g} for m16b, "
+            f"{ESP32_REFERENCE_V:g} for esp32)."
+        ),
     )
     parser.add_argument(
         "--vdrive",
         type=float,
-        default=DEFAULT_SENSOR_DRIVE_V,
-        help="Sensor drive voltage used by V_sensor = Vdrive - V_adc.",
+        default=None,
+        help=(
+            "Sensor drive voltage used by V_sensor = Vdrive - V_adc "
+            f"(default {DEFAULT_SENSOR_DRIVE_V:g} for m16b, "
+            f"{ESP32_REFERENCE_V:g} for esp32)."
+        ),
     )
 
     # BEGIN OPTIONAL OPEN-CONTACT REPAIR CLI
@@ -426,6 +500,35 @@ def parse_args():
     )
     args = parser.parse_args()
 
+    esp32 = args.board == "esp32"
+    args.esp32_pixel_bits = None  # set once the firmware has answered
+    if args.baud is None:
+        args.baud = ESP32_BAUD if esp32 else DEFAULT_BAUD
+    if args.port is None and not esp32:
+        args.port = DEFAULT_PORT
+    if args.adc_ref is None:
+        args.adc_ref = ESP32_REFERENCE_V if esp32 else DEFAULT_ADC_REFERENCE_V
+    if args.vdrive is None:
+        args.vdrive = ESP32_REFERENCE_V if esp32 else DEFAULT_SENSOR_DRIVE_V
+    if esp32:
+        # The repair looks for open contacts of the 16x16 array at 5 V.
+        args.no_open_cell_interpolation = True
+        row0, col0, rows, cols = args.roi
+        if not (
+            rows > 0
+            and cols > 0
+            and 0 <= row0
+            and row0 + rows <= ESP32_FRAME_SIDE
+            and 0 <= col0
+            and col0 + cols <= ESP32_FRAME_SIDE
+        ):
+            parser.error(
+                f"--roi {args.roi} does not fit the "
+                f"{ESP32_FRAME_SIDE}x{ESP32_FRAME_SIDE} frame"
+            )
+        if args.trigger_hz <= 0:
+            parser.error("--trigger-hz must be positive")
+
     if args.frames < 0:
         parser.error("--frames must be non-negative")
     if args.cameras < 1:
@@ -464,13 +567,14 @@ def parse_args():
         parser.error("Handshake, heartbeat, and stall timing must be positive")
     if args.adc_ref <= 0 or args.vdrive <= 0:
         parser.error("--adc-ref and --vdrive must be positive")
-    if not 0 < args.open_cell_voltage < args.vdrive:
+    repair = not args.no_open_cell_interpolation
+    if repair and not 0 < args.open_cell_voltage < args.vdrive:
         parser.error("--open-cell-voltage must satisfy 0 < value < --vdrive")
-    if not 0 < args.point_open_voltage < args.vdrive:
+    if repair and not 0 < args.point_open_voltage < args.vdrive:
         parser.error("--point-open-voltage must satisfy 0 < value < --vdrive")
     if args.point_neighbor_delta < 0:
         parser.error("--point-neighbor-delta must be non-negative")
-    if not 0 < args.line_open_voltage < args.vdrive:
+    if repair and not 0 < args.line_open_voltage < args.vdrive:
         parser.error("--line-open-voltage must satisfy 0 < value < --vdrive")
     if not 0 < args.line_open_fraction <= 1:
         parser.error("--line-open-fraction must satisfy 0 < value <= 1")
@@ -821,6 +925,162 @@ def heartbeat_worker(serial_port, write_lock, stop_event, interval):
             return
 
 
+def find_esp32_port():
+    from serial.tools import list_ports
+
+    ports = list(list_ports.comports())
+    found = [p for p in ports if (p.vid, p.pid) == ESP32_VID_PID]
+    if not found:
+        seen = (
+            "\n".join(f"  {p.device}: {p.description}" for p in ports)
+            or "  (none)"
+        )
+        raise RuntimeError(
+            "No CP2104 (ESP32 board) serial port found; pass --port. "
+            "Ports seen:\n" + seen
+        )
+    if len(found) > 1:
+        print(
+            f"Several CP2104 ports; using {found[0].device} "
+            "(pass --port to override)."
+        )
+    return found[0].device
+
+
+def read_serial_exact(serial_port, count, timeout):
+    received = bytearray()
+    deadline = time.perf_counter() + timeout
+    while len(received) < count and time.perf_counter() < deadline:
+        received.extend(serial_port.read(count - len(received)))
+    return bytes(received)
+
+
+def detect_esp32_pixel_bytes(serial_port):
+    """Bytes per pixel, from the length of one frame: 1025 or 2049 bytes.
+
+    This costs one frame and so one trigger pulse; call it before the cameras
+    start acquiring.
+    """
+    received = b""
+    for _ in range(4):  # opening the port resets the ESP32; it may be booting
+        serial_port.reset_input_buffer()
+        serial_port.write(b"w")
+        received = read_serial_exact(serial_port, ESP32_FRAME_PIXELS + 1, 1.0)
+        if len(received) == ESP32_FRAME_PIXELS + 1:
+            rest = read_serial_exact(serial_port, ESP32_FRAME_PIXELS, 0.4)
+            if not rest:
+                return 1
+            if len(rest) == ESP32_FRAME_PIXELS:
+                return 2
+            received += rest
+        time.sleep(0.5)
+    raise RuntimeError(
+        f"Unexpected reply to 'w': {len(received)} bytes (the firmware sends "
+        "1025 or 2049). Is Esp32Matrix32CameraTrigger.ino flashed, and is "
+        "another program holding the port?"
+    )
+
+
+def esp32_roi_indices(roi, flip_rows=ESP32_FLIP_ROWS):
+    """Flat indices into the 32x32 frame of the pads, R1C1 first."""
+    row0, col0, rows, cols = roi
+    frame_rows = range(row0, row0 + rows)
+    if flip_rows:
+        frame_rows = reversed(frame_rows)
+    return [
+        frame_row * ESP32_FRAME_SIDE + frame_column
+        for frame_row in frame_rows
+        for frame_column in range(col0, col0 + cols)
+    ]
+
+
+def esp32_sensor_worker(
+    serial_port,
+    pixel_bytes,
+    roi_indices,
+    trigger_hz,
+    frame_queue,
+    reader_done,
+    stats,
+    stats_lock,
+    last_activity,
+    pacer_stop_event,
+    stop_event,
+    fatal_errors,
+):
+    """Clock, trigger source and sensor reader for the ESP32 board.
+
+    One 'w' per period: the board scans, pulses the cameras once and sends the
+    frame. The frame index is the request number, so a reply that is lost or
+    misframed leaves a gap that the writer counts as a dropped frame -- the
+    cameras may still have been triggered for it, and the session is then
+    reported as not cleanly paired.
+    """
+    period = 1.0 / trigger_hz
+    frame_bytes = ESP32_FRAME_PIXELS * pixel_bytes
+    unpack = (
+        struct.Struct(f"<{ESP32_FRAME_PIXELS}H").unpack
+        if pixel_bytes == 2
+        else None
+    )
+    request_index = -1
+    try:
+        serial_port.reset_input_buffer()
+        start = time.perf_counter()
+        next_send = start
+        while not (pacer_stop_event.is_set() or stop_event.is_set()):
+            now = time.perf_counter()
+            if now < next_send:
+                # Windows sleeps in ~16 ms steps, so sleep only the bulk of
+                # the wait and spin the rest: the trigger period stays even.
+                if next_send - now > 0.02:
+                    time.sleep(next_send - now - 0.02)
+                continue
+            # A slow scan runs flat out; it must not build up a debt that is
+            # later paid back as a burst of triggers.
+            next_send = max(next_send + period, now)
+            request_index += 1
+            serial_port.write(b"w")
+            reply = read_serial_exact(
+                serial_port,
+                frame_bytes + 1,
+                ESP32_REPLY_TIMEOUT_S,
+            )
+            if len(reply) != frame_bytes + 1 or reply[-1] != 0x0A:
+                with stats_lock:
+                    stats.bad_frames += 1
+                if len(reply) == frame_bytes + 1:
+                    time.sleep(0.2)  # misframed: let the stray bytes arrive
+                serial_port.reset_input_buffer()
+                continue
+
+            host_received_ns = time.time_ns()
+            last_activity[0] = time.monotonic()
+            values = unpack(reply[:frame_bytes]) if unpack else reply
+            item = (
+                host_received_ns,
+                request_index,
+                int((time.perf_counter() - start) * 1000.0),
+                [values[index] for index in roi_indices],
+            )
+            while not stop_event.is_set():
+                try:
+                    frame_queue.put(item, timeout=0.1)
+                    with stats_lock:
+                        stats.reader_queue_peak = max(
+                            stats.reader_queue_peak,
+                            frame_queue.qsize(),
+                        )
+                    break
+                except queue.Full:
+                    continue
+    except Exception as exc:
+        if not stop_event.is_set():
+            fatal_errors.put(f"ESP32 sensor reader failed: {exc}")
+    finally:
+        reader_done.set()
+
+
 def decode_m16b_frame(frame):
     if len(frame) != BINARY_FRAME_BYTES or not frame.startswith(BINARY_MAGIC):
         return False
@@ -1167,6 +1427,7 @@ def sensor_writer_worker(
     line_neighbor_delta_v,
     interpolation_radius,
     interpolation_min_neighbors,
+    cell_names=None,
 ):
     raw_output_path = session_dir / "sensor_raw.csv"
 
@@ -1175,11 +1436,12 @@ def sensor_writer_worker(
     # optional spatial correction is enabled.
     corrected_output_path = session_dir / "sensor_corrected.csv"
     anomaly_output_path = session_dir / "sensor_anomalies.csv"
-    cell_names = [
-        f"r{row + 1}c{column + 1}_adc8"
-        for row in range(MATRIX_ROWS)
-        for column in range(MATRIX_COLS)
-    ]
+    if cell_names is None:
+        cell_names = [
+            f"r{row + 1}c{column + 1}_adc8"
+            for row in range(MATRIX_ROWS)
+            for column in range(MATRIX_COLS)
+        ]
     common_header = ["host_received_ns", "frame_index", "device_millis"]
 
     try:
@@ -1682,9 +1944,12 @@ def load_sensor_alignment_data(session_dir, args):
         reader = csv.DictReader(handle)
         cell_fields = [
             name for name in (reader.fieldnames or [])
-            if name.endswith("_adc8")
+            if CELL_FIELD.match(name)
         ]
-        if len(cell_fields) != VALUE_COUNT:
+        if not cell_fields:
+            raise ValueError("No r{R}c{C}_adc8 / _adc12 sensor columns")
+        adc_bits = int(CELL_FIELD.match(cell_fields[0]).group(1))
+        if adc_bits == 8 and len(cell_fields) != VALUE_COUNT:
             raise ValueError(
                 f"Expected {VALUE_COUNT} sensor cells, found "
                 f"{len(cell_fields)}"
@@ -1701,8 +1966,18 @@ def load_sensor_alignment_data(session_dir, args):
     if len(host_times) < 10:
         raise ValueError("Fewer than 10 valid tactile sensor frames")
 
+    # An ESP32 session states its own reference in session.json, so
+    # --align-only works on it without repeating --board.
+    adc_ref, vdrive = args.adc_ref, args.vdrive
+    try:
+        with (session_dir / "session.json").open(encoding="utf-8") as handle:
+            session_facts = json.load(handle)
+        adc_ref = float(session_facts.get("adc_reference_v") or adc_ref)
+        vdrive = float(session_facts.get("sensor_drive_v") or vdrive)
+    except (OSError, ValueError, TypeError):
+        pass
     adc = np.asarray(adc_rows, dtype=np.float64)
-    sensor_voltage = args.vdrive - adc * args.adc_ref / ADC8_MAX_VALUE
+    sensor_voltage = vdrive - adc * adc_ref / float(2**adc_bits - 1)
     return {
         "path": str(sensor_path.resolve()),
         "host_ns": np.asarray(host_times, dtype=np.int64),
@@ -2118,6 +2393,7 @@ def save_session_metadata(
     )
     metadata = {
         "saved_utc": datetime.now(timezone.utc).isoformat(),
+        "board_option": args.board,
         "arduino_port": args.port,
         "baud": args.baud,
         "serial_rx_buffer_bytes": args.serial_rx_buffer,
@@ -2130,7 +2406,11 @@ def save_session_metadata(
         "color_requested": args.color,
         "demosaic_on_save": args.demosaic_on_save,
         "images_enabled": not args.no_save_images,
-        "sensor_protocol": "M16B v1",
+        "sensor_protocol": (
+            "ESP32 AD7466 raw 32x32, 'w' per frame"
+            if args.board == "esp32"
+            else "M16B v1"
+        ),
         "sensor_correction": {
             "enabled": not args.no_open_cell_interpolation,
             "raw_file": "sensor_raw.csv",
@@ -2170,6 +2450,36 @@ def save_session_metadata(
             **(force_summary or {}),
         },
     }
+    if args.board == "esp32":
+        row0, col0, rows, cols = args.roi
+        bits = args.esp32_pixel_bits
+        # The top-level keys tactile_preprocess.session_meta() reads.
+        metadata.update(
+            {
+                "board": "esp32-4x4",
+                "rows": rows,
+                "cols": cols,
+                "adc_bits": bits,
+                "adc_max": 2**bits - 1 if bits else None,
+                "adc_reference_v": ESP32_REFERENCE_V,
+                "sensor_drive_v": ESP32_REFERENCE_V,
+                "pressure_lowers_adc": True,
+                "pad_mm": ESP32_PAD_MM,
+                "pitch_mm": None,
+                "expected_fps": args.trigger_hz,
+                "trigger_hz": args.trigger_hz,
+                "trigger_pin": "GPIO13",
+                "roi": {
+                    "row0": row0,
+                    "col0": col0,
+                    "rows": rows,
+                    "cols": cols,
+                    "frame_rows": ESP32_FRAME_SIDE,
+                    "frame_cols": ESP32_FRAME_SIDE,
+                    "flip_rows": ESP32_FLIP_ROWS,
+                },
+            }
+        )
     with (session_dir / "session.json").open("w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2)
 
@@ -2223,9 +2533,12 @@ def main():
         # 2048x1536 raw Bayer BMP is about 3 MiB per frame per camera. Adding a
         # camera raises the sustained write load proportionally, so print the
         # requirement before the run rather than discovering it as frame loss.
-        estimated_mb_per_s = args.cameras * 3.0 * 24.0
+        capture_fps = (
+            args.trigger_hz if args.board == "esp32" else M16B_TRIGGER_HZ
+        )
+        estimated_mb_per_s = args.cameras * 3.0 * capture_fps
         print(
-            f"Estimated sustained write load at 24 fps: "
+            f"Estimated sustained write load at {capture_fps:g} fps: "
             f"~{estimated_mb_per_s:.0f} MiB/s across {args.cameras} cameras",
             flush=True,
         )
@@ -2251,6 +2564,30 @@ def main():
     camera_pixel_formats = []
     serial_port = None
     acquisition_started = []
+
+    esp32 = args.board == "esp32"
+    esp32_pixel_bytes = None
+    pacer_stop_event = threading.Event()
+
+    def open_sensor_serial():
+        port = serial.Serial(
+            args.port,
+            args.baud,
+            timeout=0.2,
+            write_timeout=1.0,
+        )
+        print(f"Sensor serial: {args.port} at {args.baud} baud")
+        try:
+            port.set_buffer_size(
+                rx_size=args.serial_rx_buffer,
+                tx_size=4096,
+            )
+            print(f"Sensor serial receive buffer: {args.serial_rx_buffer} bytes")
+        except (AttributeError, OSError, serial.SerialException) as exc:
+            print(f"Serial buffer configuration warning: {exc}")
+        time.sleep(0.2)
+        port.reset_input_buffer()
+        return port
 
     stop_event = threading.Event()
     heartbeat_stop_event = threading.Event()
@@ -2295,6 +2632,21 @@ def main():
             )
 
     try:
+        if esp32:
+            # Before the cameras acquire: asking the firmware for its pixel
+            # size costs one frame, and so one trigger pulse.
+            if args.port is None:
+                args.port = find_esp32_port()
+            serial_port = open_sensor_serial()
+            esp32_pixel_bytes = detect_esp32_pixel_bytes(serial_port)
+            args.esp32_pixel_bits = 8 if esp32_pixel_bytes == 1 else 12
+            print(
+                f"ESP32 board: {args.esp32_pixel_bits}-bit pixels, pads = "
+                f"frame rows {args.roi[0]}-{args.roi[0] + args.roi[2] - 1}, "
+                f"cols {args.roi[1]}-{args.roi[1] + args.roi[3] - 1}; "
+                f"pacing at {args.trigger_hz:g} Hz"
+            )
+
         (
             system,
             camera_list,
@@ -2340,46 +2692,37 @@ def main():
             worker.start()
             workers.append(worker)
 
-        serial_port = serial.Serial(
-            args.port,
-            args.baud,
-            timeout=0.2,
-            write_timeout=1.0,
-        )
-        print(f"Arduino serial: {args.port} at {args.baud} baud")
-        try:
-            serial_port.set_buffer_size(
-                rx_size=args.serial_rx_buffer,
-                tx_size=4096,
-            )
-            print(
-                "Arduino serial receive buffer: "
-                f"{args.serial_rx_buffer} bytes"
-            )
-        except (AttributeError, OSError, serial.SerialException) as exc:
-            print(f"Serial buffer configuration warning: {exc}")
-        time.sleep(0.2)
-        serial_port.reset_input_buffer()
-        wait_for_arduino_handshake(
-            serial_port,
-            serial_write_lock,
-            args.handshake_timeout,
-        )
-        capture_start = time.monotonic()
-
-        heartbeat_thread = threading.Thread(
-            target=heartbeat_worker,
-            args=(
+        if not esp32:
+            serial_port = open_sensor_serial()
+            wait_for_arduino_handshake(
                 serial_port,
                 serial_write_lock,
-                heartbeat_stop_event,
-                args.heartbeat_interval,
-            ),
-            name="arduino-heartbeat",
-            daemon=True,
-        )
-        heartbeat_thread.start()
-        workers.append(heartbeat_thread)
+                args.handshake_timeout,
+            )
+        capture_start = time.monotonic()
+
+        if not esp32:
+            heartbeat_thread = threading.Thread(
+                target=heartbeat_worker,
+                args=(
+                    serial_port,
+                    serial_write_lock,
+                    heartbeat_stop_event,
+                    args.heartbeat_interval,
+                ),
+                name="arduino-heartbeat",
+                daemon=True,
+            )
+            heartbeat_thread.start()
+            workers.append(heartbeat_thread)
+
+        esp32_cell_names = None
+        if esp32:
+            esp32_cell_names = [
+                f"r{row + 1}c{column + 1}_adc{args.esp32_pixel_bits}"
+                for row in range(args.roi[2])
+                for column in range(args.roi[3])
+            ]
 
         sensor_writer_thread = threading.Thread(
             target=sensor_writer_worker,
@@ -2402,6 +2745,7 @@ def main():
                 args.line_neighbor_delta,
                 args.interpolation_radius,
                 args.interpolation_min_neighbors,
+                esp32_cell_names,
             ),
             name="sensor-writer",
             daemon=True,
@@ -2409,21 +2753,42 @@ def main():
         sensor_writer_thread.start()
         workers.append(sensor_writer_thread)
 
-        sensor_reader_thread = threading.Thread(
-            target=sensor_serial_reader_worker,
-            args=(
-                serial_port,
-                sensor_frame_queue,
-                sensor_reader_done,
-                sensor_stats,
-                stats_lock,
-                sensor_last_activity,
-                stop_event,
-                fatal_errors,
-            ),
-            name="sensor-serial-reader",
-            daemon=True,
-        )
+        if esp32:
+            sensor_reader_thread = threading.Thread(
+                target=esp32_sensor_worker,
+                args=(
+                    serial_port,
+                    esp32_pixel_bytes,
+                    esp32_roi_indices(args.roi),
+                    args.trigger_hz,
+                    sensor_frame_queue,
+                    sensor_reader_done,
+                    sensor_stats,
+                    stats_lock,
+                    sensor_last_activity,
+                    pacer_stop_event,
+                    stop_event,
+                    fatal_errors,
+                ),
+                name="esp32-sensor-pacer",
+                daemon=True,
+            )
+        else:
+            sensor_reader_thread = threading.Thread(
+                target=sensor_serial_reader_worker,
+                args=(
+                    serial_port,
+                    sensor_frame_queue,
+                    sensor_reader_done,
+                    sensor_stats,
+                    stats_lock,
+                    sensor_last_activity,
+                    stop_event,
+                    fatal_errors,
+                ),
+                name="sensor-serial-reader",
+                daemon=True,
+            )
         sensor_reader_thread.start()
         workers.append(sensor_reader_thread)
 
@@ -2475,7 +2840,9 @@ def main():
         print(f"Capture failed: {exc}")
     finally:
         heartbeat_stop_event.set()
-        if serial_port is not None and serial_port.is_open:
+        # The ESP32 board stops by itself once no more 'w' is sent.
+        pacer_stop_event.set()
+        if not esp32 and serial_port is not None and serial_port.is_open:
             try:
                 write_serial_command(
                     serial_port,

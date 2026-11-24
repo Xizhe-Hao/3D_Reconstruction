@@ -8,7 +8,11 @@
     python weight_cal.py --selftest                             # headless end-to-end check
 
 One run walks through every pad you list. For each pad the window outlines
-the target cell on the map, you press SPACE to start it (a new
+the target cell on the map and you press SPACE to start it. First comes the
+pre-load (--precondition N, default 10): put the --precondition-g weight
+(default the heaviest) on and take it off N times, SPACE each time; this is
+not recorded, it only breaks the fresh Velostat in so the recorded steps do
+not start low and creep up. After a --precondition-rest-s unloaded wait (a new
 capture_<stamp>_RxCy session folder opens and the first --baseline-s seconds
 must stay unloaded), then it tells you which weight to put on ("PUT ON 100 g
 on R2C2"), you centre it and press SPACE, the hold countdown runs, you take it
@@ -32,7 +36,7 @@ Per pad session, next to sensor_raw.csv and session.json:
                                     force_model_eval.py and check_cell_damage.py read it
 Then: python weight_report.py <session>        and      python weight_summary.py <root>
 
-Keys: SPACE start pad / placed / removed    U undo the last mark    N skip this step
+Keys: SPACE start pad / placed / removed    U undo the last mark    N skip this step (or the pre-load)
       P skip the rest of this pad           B redo the display baseline    Q quit (labels are written)
 """
 
@@ -55,7 +59,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "Python files"))
 from live_sensor_2d import BOARDS, Esp32Source, SerialSource, SessionRecorder  # noqa: E402
-from tactile_preprocess import baseline, clean, load_raw, response_sign, session_meta  # noqa: E402
+from tactile_preprocess import baseline, baseline_seconds, clean, load_raw, response_sign, session_meta  # noqa: E402
 
 G = 9.80665
 WEIGHT_SET_G = (10.0, 20.0, 50.0, 100.0, 200.0)
@@ -118,7 +122,7 @@ def pad_list(spec, shape, shuffle=False, seed=0):
     for r, c in pads:
         if not (0 <= r < shape[0] and 0 <= c < shape[1]):
             raise SystemExit(f"pad {pad_name((r, c))} is outside the {shape[0]}x{shape[1]} window; widen it with "
-                             f"--roi 0 0 ROWS COLS (e.g. --roi 0 0 6 6 for pads up to R6C6)")
+                             f"--roi ROW0 COL0 ROWS COLS (the default window is 28 0 4 4)")
     if shuffle:
         random.Random(seed).shuffle(pads)
     return pads
@@ -227,12 +231,12 @@ def write_labels(session: Path, platen_g: float, settle_s: float, release_s: flo
     session = Path(session)
     ns, idx, frames = load_raw(session)
     t = (ns - ns[0]) / 1e9
-    base = baseline(frames, t)
+    raw_meta = json.loads((session / "session.json").read_text(encoding="utf-8")) if (session / "session.json").exists() else {}
+    base = baseline(frames, t, baseline_seconds(raw_meta))
     meta = session_meta(session, *frames.shape[1:])
     sign = response_sign(frames, base, meta)
     delta = sign * (frames - base)
     total = clean(frames, base, deadband, sign=sign).sum(axis=(1, 2))
-    raw_meta = json.loads((session / "session.json").read_text(encoding="utf-8")) if (session / "session.json").exists() else {}
     m = re.fullmatch(r"R(\d+)C(\d+)", raw_meta.get("pad_under_test") or "")
     if m and int(m.group(1)) - 1 < delta.shape[1] and int(m.group(2)) - 1 < delta.shape[2]:
         cell = delta[:, int(m.group(1)) - 1, int(m.group(2)) - 1]
@@ -354,7 +358,8 @@ class WeightSimSource:
 class Controller:
     """The pad / step machine behind the keys; independent of the window so it runs headlessly too.
 
-    states: pad_start -> baseline -> (place -> hold -> rest)* -> pad_done -> pad_start ... -> all_done
+    states: pad_start -> [precond_off <-> precond_on]* -> precond_rest -> baseline -> (place -> hold -> rest)*
+            -> pad_done -> pad_start ... -> all_done      (the pre-load states only with --precondition > 0)
     """
 
     DEBOUNCE_S = 1.0  # a second SPACE within this is a key bounce, not a weight coming off again
@@ -376,6 +381,8 @@ class Controller:
         self.step_times = []  # seconds per completed step, for the ETA
         self.sessions = []
         self.started = time.time()
+        self.pc_done = 0         # pre-load cycles finished on the current pad
+        self.pads_started = 0    # bumps when a pad's recording opens (the window re-zeroes its display then)
 
     # ---- what is where
     @property
@@ -395,13 +402,25 @@ class Controller:
         return sum(len(b) for b in self.blocks)
 
     # ---- pad sessions
+    def begin_pad(self):
+        """SPACE on a new pad: the unrecorded pre-load first (if any), then the recording."""
+        self.pc_done = 0
+        if self.args.precondition > 0:
+            if hasattr(self.source, "set_pad"):
+                self.source.set_pad(self.pad)
+            self.state, self.since = "precond_off", time.time()
+        else:
+            self.start_pad()
+
     def start_pad(self):
         pad = self.pad
         meta = {**(self.source.meta() if hasattr(self.source, "meta") else BOARDS[self.args.board]),
                 "pad_under_test": pad_name(pad), "platen_g": self.args.platen_g,
                 "weights_g": [float(w) for w in self.args.weights.split(",")], "reps": self.args.reps,
                 "order": self.args.order, "hold_s": self.args.hold_s, "rest_s": self.args.rest_s,
-                "plateau_last_s": self.args.last_s}
+                "plateau_last_s": self.args.last_s, "baseline_s": self.args.baseline_s,
+                "precondition": {"cycles": self.pc_done, "mass_g": self.args.precondition_g,
+                                 "rest_s": self.args.precondition_rest_s}}
         self.recorder = SessionRecorder(self.args.record, self.source.shape, meta,
                                         tool=f"weight_cal.py pad {pad_name(pad)}", suffix=f"_{pad_name(pad)}")
         self.source.on_frame = self.recorder
@@ -409,6 +428,7 @@ class Controller:
         if hasattr(self.source, "set_pad"):
             self.source.set_pad(pad)
         self.i = 0
+        self.pads_started += 1
         self.state, self.since = "baseline", time.time()
 
     def finish_pad(self):
@@ -445,9 +465,23 @@ class Controller:
     def space(self, host_ns=None):
         if host_ns is None and self.state in ("hold", "rest") and time.time() - self.since < self.DEBOUNCE_S:
             return
+        if host_ns is None and self.state.startswith("precond") and time.time() - self.since < 0.5:
+            return
         host_ns = self.now_ns() if host_ns is None else host_ns
         if self.state == "pad_start":
-            self.start_pad()
+            self.begin_pad()
+        elif self.state == "precond_off":                  # weight placed
+            if hasattr(self.source, "set_mass"):
+                self.source.set_mass(self.args.precondition_g)
+            self.state, self.since = "precond_on", time.time()
+        elif self.state == "precond_on":                   # weight removed
+            if hasattr(self.source, "set_mass"):
+                self.source.set_mass(0.0)
+            self.pc_done += 1
+            self.state = "precond_rest" if self.pc_done >= self.args.precondition else "precond_off"
+            self.since = time.time()
+        elif self.state == "precond_rest":
+            pass  # the wait lets the pad recover before its baseline
         elif self.state == "baseline":
             pass  # keep the pad empty; the analysis takes its baseline from these seconds
         elif self.state == "place":
@@ -468,10 +502,12 @@ class Controller:
             self.b += 1
             self.state = "pad_start" if self.b < len(self.pads) else "all_done"
             if self.state == "pad_start":
-                self.start_pad()
+                self.begin_pad()
 
     def tick(self):
-        if self.state == "baseline" and time.time() - self.since >= self.args.baseline_s:
+        if self.state == "precond_rest" and time.time() - self.since >= self.args.precondition_rest_s:
+            self.start_pad()
+        elif self.state == "baseline" and time.time() - self.since >= self.args.baseline_s:
             self.state, self.since = "place", time.time()
         elif self.state == "rest" and time.time() - self.since >= self.args.rest_s:
             self._advance()
@@ -524,6 +560,11 @@ class Controller:
             self.state, self.since = "rest", time.time()
 
     def skip_step(self):
+        if self.state.startswith("precond"):             # N: end the pre-load now (weight must be off)
+            if self.state == "precond_on" and hasattr(self.source, "set_mass"):
+                self.source.set_mass(0.0)
+            self.state, self.since = "precond_rest", time.time()
+            return
         if self.state == "hold":
             self.space(self.now_ns())
         if self.state in ("place", "rest"):
@@ -545,7 +586,8 @@ class Controller:
         done = self.done_steps
         total = self.total_steps
         per = np.mean(self.step_times[-10:]) if self.step_times else (self.args.hold_s + self.args.rest_s + 6)
-        left = (total - done) * per + (len(self.pads) - self.b - 1) * (self.args.baseline_s + 20)
+        pre = self.args.precondition * 5.0 + self.args.precondition_rest_s if self.args.precondition else 0.0
+        left = (total - done) * per + (len(self.pads) - self.b - 1) * (self.args.baseline_s + 20 + pre)
         elapsed = time.time() - self.started
         return (f"pad {min(self.b + 1, len(self.pads))}/{len(self.pads)}   step {done}/{total}   "
                 f"elapsed {elapsed / 60:.0f} min   about {max(left, 0) / 60:.0f} min left")
@@ -556,6 +598,15 @@ class Controller:
             return "ALL PADS DONE - press Q", "#2a9d3a"
         if self.state == "pad_start":
             return f"NEXT PAD: {pad}\nmove the weights there, keep it EMPTY,\nthen press SPACE to start", "#1f5fbf"
+        if self.state == "precond_off":
+            return (f"{pad}: PRE-LOAD {self.pc_done + 1}/{self.args.precondition} (not recorded)\n"
+                    f"PUT ON {self.args.precondition_g:g} g on {pad}, then SPACE\n(N = skip the pre-load)"), "#8e44ad"
+        if self.state == "precond_on":
+            return (f"{pad}: PRE-LOAD {self.pc_done + 1}/{self.args.precondition} (not recorded)\n"
+                    f"TAKE OFF the {self.args.precondition_g:g} g, then SPACE"), "#8e44ad"
+        if self.state == "precond_rest":
+            left = self.args.precondition_rest_s - (time.time() - self.since)
+            return f"{pad}: pre-load done, recovering  {max(left, 0):3.1f} s\nkeep the pad EMPTY", "#b8860b"
         if self.state == "baseline":
             left = self.args.baseline_s - (time.time() - self.since)
             return f"{pad}: no-load baseline  {max(left, 0):3.1f} s\nkeep the pad empty", "#b8860b"
@@ -588,6 +639,7 @@ class WeightWindow:
         self.lowers = BOARDS[source.board]["pressure_lowers_adc"]
         self.base_samples, self.base = [], None
         self.base_t0 = None
+        self.seen_starts = 0
         self.trend_t, self.trend_v = [], []
         self.t0 = time.perf_counter()
         self.closed = False
@@ -635,10 +687,7 @@ class WeightWindow:
         if k == " ":
             if self.ctl.state in ("place", "hold") and self.base is None:
                 return
-            was_start = self.ctl.state == "pad_start"
             self.ctl.space()
-            if was_start:
-                self.base, self.base_samples = None, []  # display baseline per pad, like the analysis one
         elif k == "u":
             self.ctl.undo()
         elif k == "n":
@@ -655,6 +704,9 @@ class WeightWindow:
         g = grid.astype(float) / self.scale
         now = time.perf_counter() - self.t0
         pad = self.ctl.pad
+        if self.ctl.pads_started != self.seen_starts:      # a pad's recording just opened: re-zero the display
+            self.seen_starts = self.ctl.pads_started
+            self.base, self.base_samples = None, []
         if pad != self.shown_pad and pad is not None:
             self.shown_pad = pad
             self.target.set_xy((pad[1] - 0.5, pad[0] - 0.5))
@@ -754,16 +806,24 @@ def parse_args(argv=None):
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--hold-s", type=float, default=15.0, help="seconds a weight stays on (it creeps for ~5-10 s)")
     p.add_argument("--rest-s", type=float, default=8.0, help="unloaded seconds between steps")
-    p.add_argument("--baseline-s", type=float, default=5.0, help="unloaded seconds at each pad's start")
+    p.add_argument("--baseline-s", type=float, default=15.0,
+                   help="unloaded seconds at each pad's start; the analysis takes the pad's baseline from all of them")
+    p.add_argument("--precondition", type=int, default=10,
+                   help="unrecorded put-on/take-off cycles before each pad's recording (break-in); 0 = off")
+    p.add_argument("--precondition-g", type=float, default=None, help="pre-load weight, g (default: the heaviest)")
+    p.add_argument("--precondition-rest-s", type=float, default=10.0,
+                   help="unloaded wait after the last pre-load before the baseline starts")
     p.add_argument("--last-s", type=float, default=PLATEAU_LAST_S, help="plateau = the last seconds of the hold")
     p.add_argument("--settle-s", type=float, default=3.0, help="label: at least these seconds after 'on' are loading")
     p.add_argument("--release-s", type=float, default=2.0, help="label: seconds after 'off' counted as unloading")
     p.add_argument("--deadband", type=float, default=0.0, help="label: deadband for tactile_response (counts)")
     p.add_argument("--bits", type=int, choices=(8, 12), default=None)
     p.add_argument("--roi", type=int, nargs=4, metavar=("ROW0", "COL0", "ROWS", "COLS"), default=None,
-                   help="window of the 32x32 frame that holds wired pads (default 0 0 4 4); "
-                        "pads named RxCy count from the window's top-left")
+                   help="window of the 32x32 frame that holds wired pads (default 28 0 4 4); "
+                        "rows are read bottom to top, so R1 is the window's last frame row and C1 its first column")
     args = p.parse_args(argv)
+    if args.precondition_g is None:
+        args.precondition_g = max(float(w) for w in args.weights.split(",") if w.strip())
     if args.selftest:
         args.simulate = True
     if args.pad and not args.pads:
@@ -815,8 +875,20 @@ def run_selftest(args):
         for _ in range(int(seconds * fps)):
             source.read_latest()
 
-    for _ in pads:
-        ctl.space(source.now_ns())  # pad_start -> start_pad
+    args.precondition, args.precondition_rest_s = 2, 0.0
+    for k, _ in enumerate(pads):
+        ctl.space(source.now_ns())  # pad_start -> pre-load
+        if k == 0:
+            for _ in range(args.precondition):
+                ctl.space(source.now_ns())
+                feed(1)                                   # on
+                ctl.space(source.now_ns())
+                feed(1)                                   # off
+        else:
+            ctl.skip_step()                               # N skips the pre-load
+        assert ctl.state == "precond_rest", ctl.state
+        ctl.tick()                                        # rest 0 s -> the recording opens
+        assert ctl.state == "baseline", ctl.state
         feed(args.baseline_s + 1)
         ctl.state, ctl.since = "place", time.time()  # what tick() does after --baseline-s of wall time
         for step in ctl.steps:
@@ -827,8 +899,9 @@ def run_selftest(args):
             ctl.space(source.now_ns())           # off
             feed(args.rest_s)
             ctl.space(source.now_ns())           # rest -> advance
-        if ctl.state == "pad_done":
-            ctl.space(source.now_ns())           # next pad
+        if ctl.state == "pad_done":              # next pad: what SPACE does, minus starting its pre-load
+            ctl.b += 1
+            ctl.state = "pad_start" if ctl.b < len(pads) else "all_done"
     ctl.close()
     for session in ctl.sessions:
         rows = list(csv.DictReader((session / "force_alignment" / "frames.csv").open()))
@@ -858,8 +931,11 @@ def main(argv=None):
     pads = pad_list(args.pads, source.shape, args.shuffle_pads, args.seed)
     masses = build_masses(args)
     per_pad = len(masses) * args.reps
+    pre = (args.precondition * 5.0 + args.precondition_rest_s) if args.precondition else 0.0
     print(f"{len(pads)} pads x {per_pad} steps ({len(masses)} masses x {args.reps} reps), about "
-          f"{len(pads) * (per_pad * (args.hold_s + args.rest_s + 6) + 30) / 60:.0f} min; pad order: "
+          f"{len(pads) * (per_pad * (args.hold_s + args.rest_s + 6) + 30 + pre) / 60:.0f} min; "
+          + (f"pre-load {args.precondition} x {args.precondition_g:g} g per pad (not recorded); "
+             if args.precondition else "") + "pad order: "
           + " ".join(pad_name(p) for p in pads), flush=True)
     source.start()
     ctl = Controller(pads, masses, args, source)

@@ -52,6 +52,10 @@ def main() -> int:
     parser.add_argument("--warmup", type=float, default=3.0,
                         help="seconds the D455 streams before the capture starts")
     parser.add_argument("--no-align", action="store_true")
+    parser.add_argument("--serials", nargs="+", default=None, metavar="SERIAL",
+                        help="record several RealSense cameras, one recorder each; their "
+                             "frames go to <session>/d405_<serial>/. Default: the one camera "
+                             "connected, into <session>/d455/ as before")
     args = parser.parse_args(own)
     if any(a == "--output" for a in capture_args):
         parser.error("give --output before `--`; it is shared by both recordings")
@@ -64,16 +68,28 @@ def main() -> int:
 
     python = sys.executable
     flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
-    d455 = subprocess.Popen(
-        [python, "-u", str(HERE / "record_d455.py"), "--output", str(output),
-         "--stop-file", str(stop_file), *(["--near"] if args.near else []),
-         *args.d455_args.split()],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, creationflags=flags,
-        start_new_session=(os.name != "nt"))
-    threading.Thread(target=pump, args=(d455.stdout, "[d455] "), daemon=True).start()
+    recorders = []                     # (serial or None, process)
+    for serial in (args.serials or [None]):
+        tag = f"[{serial}] " if serial else "[d455] "
+        process = subprocess.Popen(
+            [python, "-u", str(HERE / "record_d455.py"), "--output", str(output),
+             "--stop-file", str(stop_file), *(["--serial", serial] if serial else []),
+             *(["--near"] if args.near else []), *args.d455_args.split()],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, creationflags=flags,
+            start_new_session=(os.name != "nt"))
+        threading.Thread(target=pump, args=(process.stdout, tag), daemon=True).start()
+        recorders.append((serial, process))
     time.sleep(args.warmup)
-    if d455.poll() is not None:
-        print("D455 recording did not start; see the [d455] lines above.")
+    failed = [serial or "D455" for serial, process in recorders if process.poll() is not None]
+    if failed:
+        print(f"depth recording did not start for {', '.join(failed)}; see the lines above.")
+        stop_file.touch()
+        for _, process in recorders:
+            try:
+                process.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+        stop_file.unlink(missing_ok=True)
         return 1
 
     # Ctrl+C belongs to the capture; this process just waits for it to finish.
@@ -84,11 +100,12 @@ def main() -> int:
     code = capture.wait()
 
     stop_file.touch()
-    try:
-        d455.wait(timeout=20)
-    except subprocess.TimeoutExpired:
-        print("D455 recording did not stop in 20 s; terminating it.")
-        d455.terminate()
+    for serial, process in recorders:
+        try:
+            process.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            print(f"{serial or 'D455'} recording did not stop in 20 s; terminating it.")
+            process.terminate()
     stop_file.unlink(missing_ok=True)
 
     new = sorted(p for p in output.glob("capture_*") if p.name not in before and p.is_dir())
@@ -97,10 +114,16 @@ def main() -> int:
         return code or 1
     session = new[-1]
     print(f"\ncapture session: {session}  (capture exit code {code})")
+    serials = args.serials or [None]
     if args.no_align:
-        print(f"next: python align_d455.py \"{session}\"")
+        for serial in serials:
+            print(f"next: python align_d455.py \"{session}\"" + (f" --serial {serial}" if serial else ""))
         return code
-    return subprocess.call([python, str(HERE / "align_d455.py"), str(session)]) or code
+    worst = 0
+    for serial in serials:
+        worst = max(worst, subprocess.call([python, str(HERE / "align_d455.py"), str(session),
+                                            *(["--serial", serial] if serial else [])]))
+    return worst or code
 
 
 if __name__ == "__main__":

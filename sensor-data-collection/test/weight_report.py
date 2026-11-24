@@ -37,7 +37,7 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "Python files"))
-from tactile_preprocess import baseline, frame_rate, load_raw, response_sign, session_meta  # noqa: E402
+from tactile_preprocess import baseline, baseline_seconds, frame_rate, load_raw, response_sign, session_meta  # noqa: E402
 from weight_cal import G, SPREAD_COUNTS, intervals, read_events, refine_edges  # noqa: E402
 
 
@@ -69,7 +69,7 @@ def main() -> None:
     raw_meta = json.loads((s / "session.json").read_text(encoding="utf-8")) if (s / "session.json").exists() else {}
     platen_g = args.platen_g if args.platen_g is not None else float(raw_meta.get("platen_g") or 0.0)
     last_s = args.last_s if args.last_s is not None else float(raw_meta.get("plateau_last_s") or 5.0)
-    base = baseline(frames, t)
+    base = baseline(frames, t, baseline_seconds(raw_meta))
     sign = response_sign(frames, base, meta)
     delta = sign * (frames - base)  # pressure positive, no deadband: 0.1 N must stay visible
     steps = intervals(read_events(s))

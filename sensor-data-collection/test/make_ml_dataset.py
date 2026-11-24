@@ -40,7 +40,7 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "Python files"))
-from tactile_preprocess import baseline, load_raw, response_sign, session_meta  # noqa: E402
+from tactile_preprocess import baseline, baseline_seconds, load_raw, response_sign, session_meta  # noqa: E402
 from weight_cal import G, PLATEAU_LAST_S, intervals, read_events, refine_edges  # noqa: E402
 
 
@@ -67,7 +67,7 @@ def export_session(s: Path, args):
     ns, idx, frames = load_raw(s)  # 8-bit-equivalent counts
     t = (ns - ns[0]) / 1e9
     meta = session_meta(s, *frames.shape[1:])
-    base = baseline(frames, t)
+    base = baseline(frames, t, baseline_seconds(meta_raw))
     sign = response_sign(frames, base, meta)
     delta = sign * (frames - base)
     bits = int(meta_raw.get("adc_bits") or 8)
